@@ -27,8 +27,8 @@ import (
 	"github.com/megaease/easegress/pkg/context"
 	"github.com/megaease/easegress/pkg/logger"
 	"github.com/megaease/easegress/pkg/object/httppipeline"
-	"github.com/megaease/easegress/pkg/supervisor"
 	libcb "github.com/megaease/easegress/pkg/util/circuitbreaker"
+	"github.com/megaease/easegress/pkg/util/fasttime"
 	"github.com/megaease/easegress/pkg/util/urlrule"
 )
 
@@ -48,9 +48,9 @@ type (
 	// Policy defines the policy of a circuit breaker
 	Policy struct {
 		Name                             string `yaml:"name" jsonschema:"required"`
-		SlidingWindowType                string `yaml:"slidingWindowType" jsonschema:"omitempty" jsonschema:"omitempty,enum=COUNT_BASED,enum=TIME_BASED"`
-		FailureRateThreshold             uint8  `yaml:"failureRateThreshold" jsonschema:"omitempty,minimum=1,maximum=100"`
-		SlowCallRateThreshold            uint8  `yaml:"slowCallRateThreshold" jsonschema:"omitempty,minimum=1,maximum=100"`
+		SlidingWindowType                string `yaml:"slidingWindowType"  jsonschema:"omitempty,enum=COUNT_BASED,enum=TIME_BASED"`
+		FailureRateThreshold             uint8  `yaml:"failureRateThreshold" jsonschema:"omitempty,maximum=100"`
+		SlowCallRateThreshold            uint8  `yaml:"slowCallRateThreshold" jsonschema:"omitempty,maximum=100"`
 		CountingNetworkError             bool   `yaml:"countingNetworkError" jsonschema:"omitempty"`
 		SlidingWindowSize                uint32 `yaml:"slidingWindowSize" jsonschema:"omitempty,minimum=1"`
 		PermittedNumberOfCallsInHalfOpen uint32 `yaml:"permittedNumberOfCallsInHalfOpenState" jsonschema:"omitempty"`
@@ -77,9 +77,8 @@ type (
 
 	// CircuitBreaker defines the circuit breaker
 	CircuitBreaker struct {
-		super    *supervisor.Supervisor
-		pipeSpec *httppipeline.FilterSpec
-		spec     *Spec
+		filterSpec *httppipeline.FilterSpec
+		spec       *Spec
 	}
 
 	// Status is the status of CircuitBreaker.
@@ -88,8 +87,8 @@ type (
 	}
 )
 
-// Validate implements custom validation for Spec
-func (spec Spec) Validate() error {
+// check policy of url usage whether defined
+func (spec Spec) validateURLPoliciesUsage() error {
 URLLoop:
 	for _, u := range spec.URLs {
 		name := u.PolicyRef
@@ -109,7 +108,29 @@ URLLoop:
 	return nil
 }
 
-func (url *URLRule) createCircuitBreaker() {
+func (spec Spec) validatePoliciesSpec() error {
+	for _, p := range spec.Policies {
+		if p.FailureRateThreshold != 0 && len(p.FailureStatusCodes) == 0 && !p.CountingNetworkError {
+			return fmt.Errorf("policy '%s' has set failure threshold and countingNetworkError is false, but not set failure status code", p.Name)
+		}
+	}
+	return nil
+}
+
+// Validate implements custom validation for Spec
+func (spec Spec) Validate() error {
+	err := spec.validateURLPoliciesUsage()
+	if err != nil {
+		return err
+	}
+	err = spec.validatePoliciesSpec()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (url *URLRule) buildPolicy() *libcb.Policy {
 	policy := libcb.Policy{
 		FailureRateThreshold:             url.policy.FailureRateThreshold,
 		SlowCallRateThreshold:            url.policy.SlowCallRateThreshold,
@@ -159,7 +180,12 @@ func (url *URLRule) createCircuitBreaker() {
 		policy.WaitDurationInOpen = time.Minute
 	}
 
-	url.cb = libcb.New(&policy)
+	return &policy
+}
+
+func (url *URLRule) createCircuitBreaker() {
+	policy := url.buildPolicy()
+	url.cb = libcb.New(policy)
 }
 
 // Kind returns the kind of CircuitBreaker.
@@ -185,7 +211,7 @@ func (cb *CircuitBreaker) Results() []string {
 func (cb *CircuitBreaker) setStateListenerForURL(u *URLRule) {
 	u.cb.SetStateListener(func(event *libcb.Event) {
 		logger.Infof("state of circuit breaker '%s' on URL(%s) transited from %s to %s at %d, reason: %s",
-			cb.pipeSpec.Name(),
+			cb.filterSpec.Name(),
 			u.ID(),
 			event.OldState,
 			event.NewState,
@@ -272,18 +298,14 @@ OuterLoop:
 }
 
 // Init initializes CircuitBreaker.
-func (cb *CircuitBreaker) Init(pipeSpec *httppipeline.FilterSpec, super *supervisor.Supervisor) {
-	cb.pipeSpec = pipeSpec
-	cb.spec = pipeSpec.FilterSpec().(*Spec)
-	cb.super = super
+func (cb *CircuitBreaker) Init(filterSpec *httppipeline.FilterSpec) {
+	cb.filterSpec, cb.spec = filterSpec, filterSpec.FilterSpec().(*Spec)
 	cb.reload(nil)
 }
 
 // Inherit inherits previous generation of CircuitBreaker.
-func (cb *CircuitBreaker) Inherit(pipeSpec *httppipeline.FilterSpec, previousGeneration httppipeline.Filter, super *supervisor.Supervisor) {
-	cb.pipeSpec = pipeSpec
-	cb.spec = pipeSpec.FilterSpec().(*Spec)
-	cb.super = super
+func (cb *CircuitBreaker) Inherit(filterSpec *httppipeline.FilterSpec, previousGeneration httppipeline.Filter) {
+	cb.filterSpec, cb.spec = filterSpec, filterSpec.FilterSpec().(*Spec)
 	cb.reload(previousGeneration.(*CircuitBreaker))
 }
 
@@ -296,7 +318,7 @@ func (cb *CircuitBreaker) handle(ctx context.HTTPContext, u *URLRule) string {
 		return ctx.CallNextHandler(resultShortCircuited)
 	}
 
-	start := time.Now()
+	start := fasttime.Now()
 	defer func() {
 		if e := recover(); e != nil {
 			d := time.Since(start)
@@ -333,7 +355,7 @@ func (cb *CircuitBreaker) Handle(ctx context.HTTPContext) string {
 	return ctx.CallNextHandler("")
 }
 
-// Status returns Status genreated by Runtime.
+// Status returns Status generated by Runtime.
 func (cb *CircuitBreaker) Status() interface{} {
 	return nil
 }

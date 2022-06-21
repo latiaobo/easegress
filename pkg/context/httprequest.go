@@ -25,14 +25,11 @@ import (
 
 	"github.com/megaease/easegress/pkg/util/callbackreader"
 	"github.com/megaease/easegress/pkg/util/httpheader"
-	"github.com/megaease/easegress/pkg/util/stringtool"
 )
 
 type (
 	httpRequest struct {
 		std       *http.Request
-		method    string
-		path      string
 		header    *httpheader.HTTPHeader
 		body      *callbackreader.CallbackReader
 		bodyCount int
@@ -52,14 +49,12 @@ func newHTTPRequest(stdr *http.Request) *httpRequest {
 
 	hq := &httpRequest{
 		std:    stdr,
-		method: stdr.Method,
-		path:   stdr.URL.Path,
 		header: httpheader.New(stdr.Header),
 		body:   callbackreader.New(stdr.Body),
 		realIP: realip.FromRequest(stdr),
 	}
 
-	// NOTE: Always count orinal body, even the body could be changed
+	// NOTE: Always count original body, even the body could be changed
 	// by SetBody().
 	hq.body.OnAfter(func(num int, p []byte, n int, err error) ([]byte, int, error) {
 		hq.bodyCount += n
@@ -67,12 +62,19 @@ func newHTTPRequest(stdr *http.Request) *httpRequest {
 	})
 
 	// Reference: https://tools.ietf.org/html/rfc2616#section-5
-	// NOTE: We don't use httputil.DumpRequest because it does not
-	// completely output plain HTTP Request.
-	meta := stringtool.Cat(stdr.Method, " ", stdr.URL.RequestURI(), " ", stdr.Proto, "\r\n",
-		hq.Header().Dump(), "\r\n\r\n")
+	//
+	// meta length is the length of:
+	// w.stdr.Method + " "
+	// + stdr.URL.RequestURI() + " "
+	// + stdr.Proto + "\r\n",
+	// + w.Header().Dump() + "\r\n\r\n"
+	//
+	// but to improve performance, we won't build this string
 
-	hq.metaSize = len(meta)
+	hq.metaSize += len(stdr.Method) + 1
+	hq.metaSize += len(stdr.URL.RequestURI()) + 1
+	hq.metaSize += len(stdr.Proto) + 2
+	hq.metaSize += hq.Header().Length() + 4
 
 	return hq
 }
@@ -82,15 +84,27 @@ func (r *httpRequest) RealIP() string {
 }
 
 func (r *httpRequest) Method() string {
-	return r.method
+	return r.std.Method
 }
 
 func (r *httpRequest) SetMethod(method string) {
-	r.method = method
+	r.std.Method = method
 }
 
 func (r *httpRequest) Scheme() string {
-	return r.std.URL.Scheme
+	if scheme := r.std.URL.Scheme; scheme != "" {
+		return scheme
+	}
+
+	if scheme := r.std.Header.Get("X-Forwarded-Proto"); scheme != "" {
+		return scheme
+	}
+
+	if r.std.TLS != nil {
+		return "https"
+	}
+
+	return "http"
 }
 
 func (r *httpRequest) Host() string {
@@ -102,11 +116,11 @@ func (r *httpRequest) SetHost(host string) {
 }
 
 func (r *httpRequest) Path() string {
-	return r.path
+	return r.std.URL.Path
 }
 
 func (r *httpRequest) SetPath(path string) {
-	r.path = path
+	r.std.URL.Path = path
 }
 
 func (r *httpRequest) EscapedPath() string {
@@ -149,8 +163,8 @@ func (r *httpRequest) Body() io.Reader {
 	return r.body
 }
 
-func (r *httpRequest) SetBody(reader io.Reader) {
-	r.body = callbackreader.New(reader)
+func (r *httpRequest) SetBody(reader io.Reader, closePreviousReader bool) {
+	r.body.SetReader(reader, closePreviousReader)
 }
 
 func (r *httpRequest) Size() uint64 {
@@ -159,7 +173,7 @@ func (r *httpRequest) Size() uint64 {
 
 func (r *httpRequest) finish() {
 	// NOTE: We don't use this line in case of large flow attack.
-	// io.Copy(ioutil.Discard, r.std.Body)
+	// io.Copy(io.Discard, r.std.Body)
 
 	// NOTE: The server will do it for us.
 	// r.std.Body.Close()

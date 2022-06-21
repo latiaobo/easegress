@@ -31,7 +31,6 @@ import (
 	"go.etcd.io/etcd/server/v3/embed"
 	yaml "gopkg.in/yaml.v2"
 
-	"github.com/megaease/easegress/pkg/common"
 	"github.com/megaease/easegress/pkg/logger"
 	"github.com/megaease/easegress/pkg/option"
 )
@@ -54,6 +53,8 @@ const (
 
 	// lease config
 	leaseTTL = clientv3.MaxLeaseTTL // 9000000000Second=285Year
+
+	minTTL = 5 // grant a new lease if the lease ttl is less than minTTL
 )
 
 type (
@@ -66,7 +67,7 @@ type (
 
 		LastDefragTime string `yaml:"lastDefragTime,omitempty"`
 
-		// Etcd is non-nil only it is a writer.
+		// Etcd is non-nil only if it's cluster status is primary.
 		Etcd *EtcdStatus `yaml:"etcd,omitempty"`
 	}
 
@@ -86,12 +87,13 @@ type (
 	}
 )
 
-func strTolease(s string) (clientv3.LeaseID, error) {
-	lease, err := strconv.ParseInt(s, 16, 64)
+func strToLease(s string) (*clientv3.LeaseID, error) {
+	leaseNum, err := strconv.ParseInt(s, 16, 64)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return clientv3.LeaseID(lease), nil
+	leaseID := clientv3.LeaseID(leaseNum)
+	return &leaseID, nil
 }
 
 func newEtcdStats(buff []byte) (*etcdStats, error) {
@@ -141,77 +143,89 @@ func New(opt *option.Options) (Cluster, error) {
 		return nil, fmt.Errorf("invalid cluster request timeout: %v", err)
 	}
 
-	members, err := newMembers(opt)
-	if err != nil {
-		return nil, fmt.Errorf("new members failed: %v", err)
+	// Member file，members.ClusterMembers and members.KnownMembers will be deprecated in the future.
+	// When the new configuration way (cluster.initial-cluster or cluster.primary-listen-peer-urls) is used, let's not create member
+	// instance but let's read member information from pkg/option/options.go's Options.ClusterOptions directly.
+	var membersFile *members
+	if len(opt.GetPeerURLs()) == 0 {
+		membersFile, err = newMembers(opt)
+		if err != nil {
+			return nil, fmt.Errorf("new members failed: %v", err)
+		}
 	}
 
 	c := &cluster{
 		opt:            opt,
 		requestTimeout: requestTimeout,
-		members:        members,
+		members:        membersFile,
 		done:           make(chan struct{}),
 	}
 
 	c.initLayout()
 
-	go c.run()
+	c.run()
 
 	return c, nil
 }
 
+func (c *cluster) IsLeader() bool {
+	server, err := c.getServer()
+	if err != nil {
+		return false
+	}
+
+	return server.Server.Leader() == server.Server.ID()
+}
+
 // requestContext returns context with request timeout,
 // please use it immediately in case of incorrect timeout.
-func (c *cluster) requestContext() context.Context {
-	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
-	go func() {
-		time.Sleep(c.requestTimeout)
-		cancel()
-	}()
-	return ctx
+func (c *cluster) requestContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), c.requestTimeout)
 }
 
 // longRequestContext takes 3 times longer than requestContext.
-func (c *cluster) longRequestContext() context.Context {
+func (c *cluster) longRequestContext() (context.Context, context.CancelFunc) {
 	requestTimeout := 3 * c.requestTimeout
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	go func() {
-		time.Sleep(requestTimeout)
-		cancel()
-	}()
-	return ctx
+	return context.WithTimeout(context.Background(), requestTimeout)
 }
 
 func (c *cluster) run() {
-	logger.Infof("starting etcd cluster")
-	for i := 0; ; i++ {
-		err := c.getReady()
-		if err != nil {
-			logger.Errorf("start cluster failed (%d retries): %v", i, err)
-			if i > 3 {
+	tryTimes := 0
+	tryReady := func() error {
+		tryTimes++
+		return c.getReady()
+	}
+
+	// NOTE: Try to be ready in first time synchronously.
+	// If it got failed, try it asynchronously.
+	if err := tryReady(); err != nil {
+		logger.Errorf("start cluster failed (%d retries): %v", tryTimes, err)
+
+		for {
+			time.Sleep(HeartbeatInterval)
+			err := tryReady()
+			if err != nil {
 				logger.Errorf("failed start many times(%d), "+
 					"start others if they're not online, "+
 					"otherwise purge this member, clean data directory "+
-					"and rejoin it back.", i+1)
+					"and rejoin it back.", tryTimes)
+			} else {
+				break
 			}
-			time.Sleep(HeartbeatInterval)
-			continue
 		}
-
-		break
 	}
 
 	logger.Infof("cluster is ready")
 
-	if c.opt.ClusterRole == "writer" {
+	if c.opt.ClusterRole == "primary" {
 		go c.defrag()
 	}
 
-	c.heartbeat()
+	go c.heartbeat()
 }
 
 func (c *cluster) getReady() error {
-	if c.opt.ClusterRole == "reader" {
+	if c.opt.ClusterRole == "secondary" {
 		_, err := c.getClient()
 		if err != nil {
 			return err
@@ -226,10 +240,13 @@ func (c *cluster) getReady() error {
 		if err != nil {
 			return fmt.Errorf("init lease failed: %v", err)
 		}
+
+		go c.keepAliveLease()
+
 		return nil
 	}
 
-	if !c.opt.ForceNewCluster && c.members.knownMembersLen() > 1 {
+	if !c.opt.UseInitialCluster() && !c.opt.ForceNewCluster && c.members != nil && c.members.knownMembersLen() > 1 {
 		client, _ := c.getClient()
 		if client != nil {
 			err := c.addSelfToCluster()
@@ -261,6 +278,8 @@ func (c *cluster) getReady() error {
 		return fmt.Errorf("init lease failed: %v", err)
 	}
 
+	go c.keepAliveLease()
+
 	return nil
 }
 
@@ -270,7 +289,11 @@ func (c *cluster) addSelfToCluster() error {
 		return err
 	}
 
-	respList, err := client.MemberList(c.requestContext())
+	respList, err := func() (*clientv3.MemberListResponse, error) {
+		ctx, cancel := c.requestContext()
+		defer cancel()
+		return client.MemberList(ctx)
+	}()
 	if err != nil {
 		return err
 	}
@@ -281,13 +304,17 @@ func (c *cluster) addSelfToCluster() error {
 	for _, member := range respList.Members {
 		// Reference: https://github.com/etcd-io/etcd/blob/b7bf33bf5d1cbb1092b542fc4f3cdc911ccc3eaa/etcdctl/ctlv3/command/printer.go#L164-L167
 		if len(member.Name) == 0 {
-			_, err := client.MemberRemove(c.requestContext(), member.ID)
+			_, err := func() (*clientv3.MemberRemoveResponse, error) {
+				ctx, cancel := c.requestContext()
+				defer cancel()
+				return client.MemberRemove(ctx, member.ID)
+			}()
 			if err != nil {
 				err = fmt.Errorf("remove unhealthy etcd member %x failed: %v",
 					member.ID, err)
 				panic(err)
 			} else {
-				logger.Warnf("remove unhealthy etcd memebr %x for adding self to cluster",
+				logger.Warnf("remove unhealthy etcd member %x for adding self to cluster",
 					member.ID)
 			}
 		}
@@ -316,7 +343,11 @@ func (c *cluster) addSelfToCluster() error {
 			return err
 		}
 
-		respAdd, err := client.MemberAdd(c.requestContext(), c.opt.ClusterInitialAdvertisePeerURLs)
+		respAdd, err := func() (*clientv3.MemberAddResponse, error) {
+			ctx, cancel := c.requestContext()
+			defer cancel()
+			return client.MemberAdd(ctx, c.opt.ClusterInitialAdvertisePeerURLs)
+		}()
 		if err != nil {
 			return fmt.Errorf("add member failed: %v", err)
 		}
@@ -337,30 +368,24 @@ func (c *cluster) checkClusterName() error {
 		return fmt.Errorf("failed to check cluster name: %v", err)
 	}
 
-	if value == nil {
+	if value != nil {
+		if c.opt.ClusterName != *value {
+			err := fmt.Errorf("cluster names mismatch, local(%s) != existed(%s)",
+				c.opt.ClusterName, *value)
+			logger.Errorf("%v", err)
+			panic(err)
+		}
+	} else if c.opt.UseStandaloneEtcd {
+		err := c.Put(c.Layout().ClusterNameKey(), c.opt.ClusterName)
+		if err != nil {
+			return fmt.Errorf("register cluster name %s failed: %v",
+				c.opt.ClusterName, err)
+		}
+	} else {
 		return fmt.Errorf("key %s not found", c.Layout().ClusterNameKey())
 	}
 
-	if c.opt.ClusterName != *value {
-		err := fmt.Errorf("cluster names mismatch, local(%s) != existed(%s)",
-			c.opt.ClusterName, *value)
-		logger.Errorf("%v", err)
-		panic(err)
-	}
-
 	return nil
-}
-
-// removeAndBackupEtcdData is DEPRECATED,
-// will be deleted when it's sure that we won't need it.
-func (c *cluster) removeAndBackupEtcdData() {
-	if !common.IsDirEmpty(c.opt.AbsDataDir) {
-		logger.Infof("backup and clean %s", c.opt.AbsDataDir)
-		err := common.BackupAndCleanDir(c.opt.AbsDataDir)
-		if err != nil {
-			logger.Errorf("backup and clean %s failed: %v", c.opt.AbsDataDir, err)
-		}
-	}
 }
 
 func (c *cluster) getClient() (*clientv3.Client, error) {
@@ -380,9 +405,14 @@ func (c *cluster) getClient() (*clientv3.Client, error) {
 		return c.client, nil
 	}
 
-	endpoints := c.members.knownPeerURLs()
-	if c.opt.ForceNewCluster {
-		endpoints = []string{c.members.self().PeerURL}
+	var endpoints []string
+	if c.members == nil {
+		endpoints = c.opt.GetPeerURLs()
+	} else {
+		endpoints = c.members.knownPeerURLs()
+		if c.opt.ForceNewCluster {
+			endpoints = []string{c.members.self().PeerURL}
+		}
 	}
 	logger.Infof("client connect with endpoints: %v", endpoints)
 	client, err := clientv3.New(clientv3.Config{
@@ -392,6 +422,7 @@ func (c *cluster) getClient() (*clientv3.Client, error) {
 		DialKeepAliveTime:    dialKeepAliveTime,
 		DialKeepAliveTimeout: dialKeepAliveTimeout,
 		LogConfig:            logger.EtcdClientLoggerConfig(c.opt, logger.EtcdClientFilename),
+		MaxCallSendMsgSize:   c.opt.Cluster.MaxCallSendMsgSize,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create client failed: %v", err)
@@ -423,60 +454,133 @@ func (c *cluster) closeClient() {
 func (c *cluster) getLease() (clientv3.LeaseID, error) {
 	c.leaseMutex.RLock()
 	defer c.leaseMutex.RUnlock()
+
 	if c.lease == nil {
 		return 0, fmt.Errorf("lease is not ready")
 	}
+
 	return *c.lease, nil
 }
 
-func (c *cluster) initLease() error {
-	_, err := c.getLease()
-	if err == nil {
-		return nil
+func (c *cluster) keepAliveLease() {
+	handleFailed := func() {
+		err := c.grantNewLease()
+		if err != nil {
+			logger.Errorf("grant new lease failed: %v", err)
+		}
 	}
 
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-time.After(c.requestTimeout):
+			client, err := c.getClient()
+			if err != nil {
+				logger.Errorf("get client failed: %v", err)
+				continue
+			}
+
+			leaseID, err := c.getLease()
+			if err != nil {
+				logger.Errorf("get lease failed: %v", err)
+				handleFailed()
+				continue
+			}
+
+			_, err = func() (*clientv3.LeaseKeepAliveResponse, error) {
+				ctx, cancel := c.requestContext()
+				defer cancel()
+				return client.Lease.KeepAliveOnce(ctx, leaseID)
+			}()
+			if err != nil {
+				logger.Errorf("keep alive for lease %x failed: %v", leaseID, err)
+				handleFailed()
+				continue
+			}
+		}
+	}
+}
+
+func (c *cluster) initLease() error {
 	leaseStr, err := c.Get(c.Layout().Lease())
 	if err != nil {
 		return err
 	}
 
+	var leaseID *clientv3.LeaseID
 	if leaseStr != nil {
-		lease, err := strTolease(*leaseStr)
+		leaseID, err = strToLease(*leaseStr)
 		if err != nil {
 			logger.Errorf("BUG: parse lease %s failed: %v", *leaseStr, err)
 			return err
 		}
-
-		c.leaseMutex.Lock()
-		c.lease = &lease
-		logger.Infof("lease is ready")
-		c.leaseMutex.Unlock()
-
-		return nil
 	}
 
 	client, err := c.getClient()
 	if err != nil {
-		return err
+		return fmt.Errorf("get client failed: %v", err)
 	}
 
-	respGrant, err := client.Lease.Grant(c.requestContext(), leaseTTL)
+	if leaseID != nil {
+		resp, err := func() (*clientv3.LeaseTimeToLiveResponse, error) {
+			ctx, cancel := c.requestContext()
+			defer cancel()
+			return client.Lease.TimeToLive(ctx, *leaseID)
+		}()
+		if err != nil || resp.TTL < minTTL {
+			return c.grantNewLease()
+		}
+		// NOTE: Use existed lease.
+		c.lease = leaseID
+		logger.Infof("lease is ready(use existed one: %x)", *c.lease)
+		return nil
+
+	}
+	return c.grantNewLease()
+}
+
+func (c *cluster) grantNewLease() error {
+	client, err := c.getClient()
 	if err != nil {
-		return err
+		return fmt.Errorf("get client failed: %v", err)
 	}
-	lease := respGrant.ID
 
-	// NOTE: In case of deadlock with calling PutUnderLease below.
 	c.leaseMutex.Lock()
-	c.lease = &lease
-	logger.Infof("lease is ready")
-	c.leaseMutex.Unlock()
+	defer c.leaseMutex.Unlock()
 
-	err = c.PutUnderLease(c.Layout().Lease(), fmt.Sprintf("%x", lease))
+	respGrant, err := func() (*clientv3.LeaseGrantResponse, error) {
+		ctx, cancel := c.requestContext()
+		defer cancel()
+		return client.Lease.Grant(ctx, leaseTTL)
+	}()
 	if err != nil {
-		return fmt.Errorf("put lease to %s failed: %v",
-			c.Layout().Lease(), err)
+		return err
 	}
+
+	// NOTE: c.PutUnderLease will cause deadlock cause it used lease lock internally.
+	_, err = func() (*clientv3.PutResponse, error) {
+		ctx, cancel := c.requestContext()
+		defer cancel()
+		return client.Put(ctx, c.layout.Lease(), fmt.Sprintf("%x", respGrant.ID),
+			clientv3.WithLease(respGrant.ID))
+	}()
+
+	if err != nil {
+		// NOTE: Ignore the return error is fine.
+		func() (*clientv3.LeaseRevokeResponse, error) {
+			ctx, cancel := c.requestContext()
+			defer cancel()
+			return client.Lease.Revoke(ctx, respGrant.ID)
+		}()
+
+		return fmt.Errorf("put lease to %s failed: %v", c.Layout().Lease(), err)
+	}
+
+	lease := respGrant.ID
+	c.lease = &lease
+
+	logger.Infof("lease is ready (grant new one: %x)", *c.lease)
 
 	return nil
 }
@@ -513,6 +617,8 @@ func (c *cluster) getSession() (*concurrency.Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create session failed: %v", err)
 	}
+
+	c.session = session
 
 	logger.Infof("session is ready")
 
@@ -551,13 +657,17 @@ func closeEtcdServer(s *embed.Etcd) {
 		<-s.Server.StopNotify()
 	default:
 		s.Server.HardStop()
+		for _, client := range s.Clients {
+			if client != nil {
+				client.Close()
+			}
+		}
+		for _, peer := range s.Peers {
+			if peer != nil {
+				peer.Close()
+			}
+		}
 		logger.Infof("hard stop server")
-	}
-	for _, client := range s.Clients {
-		client.Close()
-	}
-	for _, peer := range s.Peers {
-		peer.Close()
 	}
 }
 
@@ -570,8 +680,12 @@ func (c *cluster) startServer() (done, timeout chan struct{}, err error) {
 		close(done)
 		return done, timeout, nil
 	}
-
-	etcdConfig, err := c.prepareEtcdConfig()
+	var etcdConfig *embed.Config
+	if c.opt.UseInitialCluster() {
+		etcdConfig, err = CreateStaticClusterEtcdConfig(c.opt)
+	} else {
+		etcdConfig, err = CreateEtcdConfig(c.opt, c.members)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -583,10 +697,12 @@ func (c *cluster) startServer() (done, timeout chan struct{}, err error) {
 
 	monitorServer := func(s *embed.Etcd) {
 		select {
-		case err := <-s.Err():
-			logger.Errorf("etcd server %s serve failed: %v",
-				c.server.Config().Name, err.Error())
-			closeEtcdServer(s)
+		case err, ok := <-s.Err():
+			if ok {
+				logger.Errorf("etcd server %s serve failed: %v",
+					c.server.Config().Name, err)
+				closeEtcdServer(s)
+			}
 		case <-c.done:
 			return
 		}
@@ -658,27 +774,38 @@ func (c *cluster) heartbeat() {
 	}
 }
 
+func (c *cluster) runDefrag() time.Duration {
+	client, err := c.getClient()
+	if err != nil {
+		logger.Errorf("defrag failed: get client failed: %v", err)
+		return defragFailedInterval
+	}
+	defragmentURL, err := c.opt.GetFirstAdvertiseClientURL()
+	if err != nil {
+		logger.Errorf("defrag failed: %v", err)
+		return defragNormalInterval // url is wrong
+	}
+	// NOTICE: It needs longer time than normal ones.
+	_, err = func() (*clientv3.DefragmentResponse, error) {
+		ctx, cancel := c.longRequestContext()
+		defer cancel()
+		return client.Defragment(ctx, defragmentURL)
+	}()
+	if err != nil {
+		logger.Errorf("defrag failed: %v", err)
+		return defragFailedInterval
+	}
+
+	logger.Infof("defrag successfully")
+	return defragNormalInterval
+}
+
 func (c *cluster) defrag() {
 	defragInterval := defragNormalInterval
 	for {
 		select {
 		case <-time.After(defragInterval):
-			client, err := c.getClient()
-			if err != nil {
-				defragInterval = defragFailedInterval
-				logger.Errorf("defrag failed: get client failed: %v", err)
-			}
-
-			// NOTICE: It need longer time than normal ones.
-			_, err = client.Defragment(c.longRequestContext(), c.opt.ClusterAdvertiseClientURLs[0])
-			if err != nil {
-				defragInterval = defragFailedInterval
-				logger.Errorf("defrag failed: %v", err)
-				continue
-			}
-
-			logger.Infof("defrag successfully")
-			defragInterval = defragNormalInterval
+			defragInterval = c.runDefrag()
 		case <-c.done:
 			return
 		}
@@ -690,7 +817,7 @@ func (c *cluster) syncStatus() error {
 		Options: *c.opt,
 	}
 
-	if c.opt.ClusterRole == "writer" {
+	if c.opt.ClusterRole == "primary" {
 		server, err := c.getServer()
 		if err != nil {
 			return err
@@ -724,13 +851,18 @@ func (c *cluster) updateMembers() error {
 		return err
 	}
 
-	resp, err := client.MemberList(c.requestContext())
+	resp, err := func() (*clientv3.MemberListResponse, error) {
+		ctx, cancel := c.requestContext()
+		defer cancel()
+		return client.MemberList(ctx)
+	}()
 	if err != nil {
 		return err
 	}
 
-	c.members.updateClusterMembers(resp.Members)
-
+	if c.members != nil {
+		c.members.updateClusterMembers(resp.Members)
+	}
 	return nil
 }
 
@@ -741,7 +873,11 @@ func (c *cluster) PurgeMember(memberName string) error {
 	}
 
 	// remove etcd member if there is it.
-	respList, err := client.MemberList(c.requestContext())
+	respList, err := func() (*clientv3.MemberListResponse, error) {
+		ctx, cancel := c.requestContext()
+		defer cancel()
+		return client.MemberList(ctx)
+	}()
 	if err != nil {
 		return err
 	}
@@ -752,7 +888,11 @@ func (c *cluster) PurgeMember(memberName string) error {
 		}
 	}
 	if id != nil {
-		_, err = client.MemberRemove(c.requestContext(), *id)
+		_, err = func() (*clientv3.MemberRemoveResponse, error) {
+			ctx, cancel := c.requestContext()
+			defer cancel()
+			return client.MemberRemove(ctx, *id)
+		}()
 		if err != nil {
 			return err
 		}
@@ -767,12 +907,16 @@ func (c *cluster) PurgeMember(memberName string) error {
 	if leaseStr == nil {
 		return fmt.Errorf("%s not found", leaseKey)
 	}
-	lease, err := strTolease(*leaseStr)
+	leaseID, err := strToLease(*leaseStr)
 	if err != nil {
 		return err
 	}
 
-	_, err = client.Lease.Revoke(c.requestContext(), lease)
+	_, err = func() (*clientv3.LeaseRevokeResponse, error) {
+		ctx, cancel := c.requestContext()
+		defer cancel()
+		return client.Lease.Revoke(ctx, *leaseID)
+	}()
 	if err != nil {
 		return err
 	}

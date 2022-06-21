@@ -19,13 +19,15 @@ package api
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"sort"
 
 	"github.com/go-chi/chi/v5"
 	yaml "gopkg.in/yaml.v2"
 
+	"github.com/megaease/easegress/pkg/object/httppipeline"
+	"github.com/megaease/easegress/pkg/object/httpserver"
 	"github.com/megaease/easegress/pkg/supervisor"
 )
 
@@ -40,64 +42,58 @@ const (
 	StatusObjectPrefix = "/status/objects"
 )
 
-func (s *Server) setupObjectAPIs() {
-	objAPIs := make([]*APIEntry, 0)
-	objAPIs = append(objAPIs,
-		&APIEntry{
+func (s *Server) objectAPIEntries() []*Entry {
+	return []*Entry{
+		{
 			Path:    ObjectKindsPrefix,
 			Method:  "GET",
 			Handler: s.listObjectKinds,
 		},
-
-		&APIEntry{
+		{
 			Path:    ObjectPrefix,
 			Method:  "POST",
 			Handler: s.createObject,
 		},
-		&APIEntry{
+		{
 			Path:    ObjectPrefix,
 			Method:  "GET",
 			Handler: s.listObjects,
 		},
-
-		&APIEntry{
+		{
 			Path:    ObjectPrefix + "/{name}",
 			Method:  "GET",
 			Handler: s.getObject,
 		},
-		&APIEntry{
+		{
 			Path:    ObjectPrefix + "/{name}",
 			Method:  "PUT",
 			Handler: s.updateObject,
 		},
-		&APIEntry{
+		{
 			Path:    ObjectPrefix + "/{name}",
 			Method:  "DELETE",
 			Handler: s.deleteObject,
 		},
-
-		&APIEntry{
+		{
 			Path:    StatusObjectPrefix,
 			Method:  "GET",
 			Handler: s.listStatusObjects,
 		},
-		&APIEntry{
+		{
 			Path:    StatusObjectPrefix + "/{name}",
 			Method:  "GET",
 			Handler: s.getStatusObject,
 		},
-	)
-
-	s.RegisterAPIs(objAPIs)
+	}
 }
 
 func (s *Server) readObjectSpec(w http.ResponseWriter, r *http.Request) (*supervisor.Spec, error) {
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read body failed: %v", err)
 	}
 
-	spec, err := supervisor.NewSpec(string(body))
+	spec, err := s.super.NewSpec(string(body))
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +201,6 @@ func (s *Server) updateObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listObjects(w http.ResponseWriter, r *http.Request) {
 	// No need to lock.
-
 	specs := specList(s._listObjects())
 	// NOTE: Keep it consistent.
 	sort.Sort(specs)
@@ -230,8 +225,13 @@ func (s *Server) getStatusObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// NOTE: Maybe inconsistent, the object was deleted already here.
-	status := s._getStatusObject(name)
+	var status map[string]string
+	if spec.Kind() == httpserver.Kind || spec.Kind() == httppipeline.Kind {
+		status = s._getStatusObjectFromTrafficController(name, spec)
+	} else {
+		// NOTE: Maybe inconsistent, the object was deleted already here.
+		status = s._getStatusObject(name)
+	}
 
 	buff, err := yaml.Marshal(status)
 	if err != nil {

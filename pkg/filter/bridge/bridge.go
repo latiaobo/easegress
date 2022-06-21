@@ -24,7 +24,6 @@ import (
 	"github.com/megaease/easegress/pkg/logger"
 	"github.com/megaease/easegress/pkg/object/httppipeline"
 	"github.com/megaease/easegress/pkg/protocol"
-	"github.com/megaease/easegress/pkg/supervisor"
 )
 
 const (
@@ -50,15 +49,19 @@ A Bridge Filter route requests to from one pipeline to other pipelines or http p
 var results = []string{resultDestinationNotFound, resultInvokeDestinationFailed}
 
 func init() {
-	httppipeline.Register(&Bridge{})
+	// FIXME: Bridge is a temporary product for some historical reason.
+	// I(@xxx7xxxx) think we should not empower filter to cross pipelines.
+
+	// httppipeline.Register(&Bridge{})
 }
 
 type (
 	// Bridge is filter Bridge.
 	Bridge struct {
-		super    *supervisor.Supervisor
-		pipeSpec *httppipeline.FilterSpec
-		spec     *Spec
+		filterSpec *httppipeline.FilterSpec
+		spec       *Spec
+
+		muxMapper protocol.MuxMapper
 	}
 
 	// Spec describes the Mock.
@@ -88,17 +91,15 @@ func (b *Bridge) Results() []string {
 }
 
 // Init initializes Bridge.
-func (b *Bridge) Init(pipeSpec *httppipeline.FilterSpec, super *supervisor.Supervisor) {
-	b.pipeSpec, b.spec, b.super = pipeSpec, pipeSpec.FilterSpec().(*Spec), super
+func (b *Bridge) Init(filterSpec *httppipeline.FilterSpec) {
+	b.filterSpec, b.spec = filterSpec, filterSpec.FilterSpec().(*Spec)
 	b.reload()
 }
 
 // Inherit inherits previous generation of Bridge.
-func (b *Bridge) Inherit(pipeSpec *httppipeline.FilterSpec,
-	previousGeneration httppipeline.Filter, super *supervisor.Supervisor) {
-
+func (b *Bridge) Inherit(filterSpec *httppipeline.FilterSpec, previousGeneration httppipeline.Filter) {
 	previousGeneration.Close()
-	b.Init(pipeSpec, super)
+	b.Init(filterSpec)
 }
 
 func (b *Bridge) reload() {
@@ -111,6 +112,11 @@ func (b *Bridge) reload() {
 func (b *Bridge) Handle(ctx context.HTTPContext) (result string) {
 	result = b.handle(ctx)
 	return ctx.CallNextHandler(result)
+}
+
+// InjectMuxMapper injects mux mapper into Bridge.
+func (b *Bridge) InjectMuxMapper(mapper protocol.MuxMapper) {
+	b.muxMapper = mapper
 }
 
 func (b *Bridge) handle(ctx context.HTTPContext) (result string) {
@@ -141,21 +147,16 @@ func (b *Bridge) handle(ctx context.HTTPContext) (result string) {
 		return resultDestinationNotFound
 	}
 
-	ro, exists := supervisor.Global.GetRunningObject(dest, supervisor.CategoryPipeline)
+	handler, exists := b.muxMapper.GetHandler(dest)
+
 	if !exists {
 		logger.Errorf("failed to get running object %s", b.spec.Destinations[0])
 		ctx.Response().SetStatusCode(http.StatusServiceUnavailable)
 		return resultDestinationNotFound
 	}
 
-	handler, ok := ro.Instance().(protocol.HTTPHandler)
-	if !ok {
-		logger.Errorf("%s is not a handler", b.spec.Destinations[0])
-		ctx.Response().SetStatusCode(http.StatusServiceUnavailable)
-		return resultInvokeDestinationFailed
-	}
-
 	handler.Handle(ctx)
+
 	return ""
 }
 

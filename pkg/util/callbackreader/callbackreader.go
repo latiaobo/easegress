@@ -43,7 +43,10 @@ type (
 // New creates CallbackReader.
 func New(r io.Reader) *CallbackReader {
 	return &CallbackReader{
-		reader: r,
+		// pre-allocate slices for performance
+		beforeFuncs: make([]BeforeFunc, 0, 1),
+		afterFuncs:  make([]AfterFunc, 0, 1),
+		reader:      r,
 	}
 }
 
@@ -54,7 +57,10 @@ func (cr *CallbackReader) Read(p []byte) (int, error) {
 		p = fn(cr.num, p)
 	}
 
-	n, err := cr.reader.Read(p)
+	n, err := 0, io.EOF
+	if cr.reader != nil {
+		n, err = cr.reader.Read(p)
+	}
 
 	for _, fn := range cr.afterFuncs {
 		p, n, err = fn(cr.num, p, n, err)
@@ -81,4 +87,16 @@ func (cr *CallbackReader) Close() error {
 	}
 
 	return nil
+}
+
+// SetReader replace previous reader with new reader. If closePreviousReader set to true, it will close
+// previous reader.
+func (cr *CallbackReader) SetReader(reader io.Reader, closePreviousReader bool) {
+	if closePreviousReader {
+		closer, ok := cr.reader.(io.Closer)
+		if ok {
+			closer.Close()
+		}
+	}
+	cr.reader = reader
 }

@@ -19,6 +19,7 @@ package meshcontroller
 
 import (
 	"github.com/megaease/easegress/pkg/logger"
+	"github.com/megaease/easegress/pkg/object/meshcontroller/api"
 	"github.com/megaease/easegress/pkg/object/meshcontroller/ingresscontroller"
 	"github.com/megaease/easegress/pkg/object/meshcontroller/label"
 	"github.com/megaease/easegress/pkg/object/meshcontroller/master"
@@ -38,9 +39,10 @@ const (
 type (
 	// MeshController is a business controller to complete MegaEase Service Mesh.
 	MeshController struct {
-		super     *supervisor.Supervisor
 		superSpec *supervisor.Spec
 		spec      *spec.Admin
+
+		api *api.API
 
 		role              string
 		master            *master.Master
@@ -74,22 +76,24 @@ func (mc *MeshController) DefaultSpec() interface{} {
 }
 
 // Init initializes MeshController.
-func (mc *MeshController) Init(superSpec *supervisor.Spec, super *supervisor.Supervisor) {
-	mc.superSpec, mc.spec, mc.super = superSpec, superSpec.ObjectSpec().(*spec.Admin), super
+func (mc *MeshController) Init(superSpec *supervisor.Spec) {
+	mc.superSpec, mc.spec = superSpec, superSpec.ObjectSpec().(*spec.Admin)
+
 	mc.reload()
 }
 
 // Inherit inherits previous generation of MeshController.
-func (mc *MeshController) Inherit(spec *supervisor.Spec,
-	previousGeneration supervisor.Object, super *supervisor.Supervisor) {
-
+func (mc *MeshController) Inherit(superSpec *supervisor.Spec, previousGeneration supervisor.Object) {
+	mc.superSpec, mc.spec = superSpec, superSpec.ObjectSpec().(*spec.Admin)
 	previousGeneration.Close()
-	mc.Init(spec, super)
+
+	mc.reload()
 }
 
 func (mc *MeshController) reload() {
-	meshRole := mc.super.Options().Labels[label.KeyRole]
-	serviceName := mc.super.Options().Labels[label.KeyServiceName]
+	mc.api = api.New(mc.superSpec)
+	meshRole := mc.superSpec.Super().Options().Labels[label.KeyRole]
+	serviceName := mc.superSpec.Super().Options().Labels[label.KeyServiceName]
 
 	switch meshRole {
 	case "", label.ValueRoleMaster, label.ValueRoleWorker:
@@ -112,17 +116,17 @@ func (mc *MeshController) reload() {
 	case label.ValueRoleMaster:
 		logger.Infof("%s running in master role", mc.superSpec.Name())
 		mc.role = label.ValueRoleMaster
-		mc.master = master.New(mc.superSpec, mc.super)
+		mc.master = master.New(mc.superSpec)
 
 	case label.ValueRoleWorker:
 		logger.Infof("%s running in worker role", mc.superSpec.Name())
 		mc.role = label.ValueRoleWorker
-		mc.worker = worker.New(mc.superSpec, mc.super)
+		mc.worker = worker.New(mc.superSpec)
 
 	case label.ValueRoleIngressController:
 		logger.Infof("%s running in ingress controller role", mc.superSpec.Name())
 		mc.role = label.ValueRoleIngressController
-		mc.ingressController = ingresscontroller.New(mc.superSpec, mc.super)
+		mc.ingressController = ingresscontroller.New(mc.superSpec)
 	}
 }
 
@@ -141,6 +145,8 @@ func (mc *MeshController) Status() *supervisor.Status {
 
 // Close closes MeshController.
 func (mc *MeshController) Close() {
+	mc.api.Close()
+
 	if mc.master != nil {
 		mc.master.Close()
 		return

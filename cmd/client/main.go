@@ -109,7 +109,10 @@ func main() {
 		command.HealthCmd(),
 		command.ObjectCmd(),
 		command.MemberCmd(),
-		command.MeshCmd(),
+		command.WasmCmd(),
+		command.CustomDataKindCmd(),
+		command.CustomDataCmd(),
+		command.ProfileCmd(),
 		completionCmd,
 	)
 

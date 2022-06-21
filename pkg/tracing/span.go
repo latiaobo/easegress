@@ -18,9 +18,11 @@
 package tracing
 
 import (
+	"sync"
 	"time"
 
-	opentracing "github.com/opentracing/opentracing-go"
+	zipkingo "github.com/openzipkin/zipkin-go"
+	zipkinmodel "github.com/openzipkin/zipkin-go/model"
 
 	"github.com/megaease/easegress/pkg/tracing/base"
 )
@@ -29,10 +31,10 @@ type (
 	// Span is the span of the Tracing.
 	Span interface {
 		// Tracer returns the Tracer that created this Span.
-		Tracer() opentracing.Tracer
+		Tracer() zipkingo.Tracer
 
 		// Context yields the SpanContext for this Span
-		Context() opentracing.SpanContext
+		Context() zipkinmodel.SpanContext
 
 		// Finish finishes the span.
 		Finish()
@@ -42,7 +44,7 @@ type (
 
 		// NewChild creates a child span.
 		NewChild(name string) Span
-		// NewChild creates a child span with start time.
+		// NewChildWithStart creates a child span with start time.
 		NewChildWithStart(name string, startAt time.Time) Span
 
 		// SetName changes the span name.
@@ -60,37 +62,26 @@ type (
 		//        "type", "cache timeout",
 		//        "waited.millis", 1500)
 		LogKV(kvs ...interface{})
+
+		// SetTag sets tag key and value.
+		SetTag(key string, value string)
+		// IsNoopSpan returns true if span is NoopSpan.
+		IsNoopSpan() bool
 	}
 
 	span struct {
+		mutex    sync.Mutex
 		tracer   *Tracing
-		span     opentracing.Span
+		span     zipkingo.Span
 		children []*span
 	}
 )
 
-// NewSpan creates a span.
-func NewSpan(tracer *Tracing, name string) Span {
-	return newSpanWithStart(tracer, name, time.Now())
+func (s *span) Tracer() *zipkingo.Tracer {
+	return s.tracer.Tracer
 }
 
-// NewSpanWithStart creates a span with specify start time.
-func NewSpanWithStart(tracer *Tracing, name string, startAt time.Time) Span {
-	return newSpanWithStart(tracer, name, startAt)
-}
-
-func newSpanWithStart(tracer *Tracing, name string, startAt time.Time) Span {
-	return &span{
-		tracer: tracer,
-		span:   tracer.StartSpan(name, opentracing.StartTime(startAt)),
-	}
-}
-
-func (s *span) Tracer() opentracing.Tracer {
-	return s.tracer
-}
-
-func (s *span) Context() opentracing.SpanContext {
+func (s *span) Context() zipkinmodel.SpanContext {
 	return s.span.Context()
 }
 
@@ -99,36 +90,8 @@ func (s *span) Finish() {
 }
 
 func (s *span) Cancel() {
-	s.span.SetTag(base.CancelTagKey, "yes")
+	s.span.Tag(base.CancelTagKey, "yes")
 	for _, child := range s.children {
 		child.Cancel()
 	}
-}
-
-func (s *span) NewChild(name string) Span {
-	return s.newChildWithStart(name, time.Now())
-}
-
-func (s *span) NewChildWithStart(name string, startAt time.Time) Span {
-	return s.newChildWithStart(name, startAt)
-}
-
-func (s *span) newChildWithStart(name string, startAt time.Time) Span {
-	childSpan := s.tracer.StartSpan(name,
-		opentracing.ChildOf(s.span.Context()),
-		opentracing.StartTime(startAt))
-	child := &span{
-		tracer: s.tracer,
-		span:   childSpan,
-	}
-	s.children = append(s.children, child)
-	return child
-}
-
-func (s span) SetName(name string) {
-	s.span.SetOperationName(name)
-}
-
-func (s span) LogKV(kv ...interface{}) {
-	s.span.LogKV(kv...)
 }

@@ -32,6 +32,7 @@ import (
 	"github.com/megaease/easegress/pkg/object/httppipeline"
 	"github.com/megaease/easegress/pkg/object/httpserver"
 	"github.com/megaease/easegress/pkg/object/statussynccontroller"
+	"github.com/megaease/easegress/pkg/object/trafficcontroller"
 	"github.com/megaease/easegress/pkg/supervisor"
 	"github.com/megaease/easegress/pkg/util/httpstat"
 )
@@ -65,8 +66,6 @@ type (
 		client      atomic.Value
 		clientMutex sync.Mutex
 
-		latestTimestamp int64
-
 		done chan struct{}
 	}
 
@@ -86,7 +85,7 @@ type (
 		Health string `json:"health"`
 	}
 
-	// GlobalFields is the global fieilds of EaseMonitor metrics.
+	// GlobalFields is the global fields of EaseMonitor metrics.
 	GlobalFields struct {
 		Timestamp int64  `json:"timestamp"`
 		Category  string `json:"category"`
@@ -161,23 +160,20 @@ func (emm *EaseMonitorMetrics) DefaultSpec() interface{} {
 	}
 }
 
-// Init initialzes EaseMonitorMetrics.
-func (emm *EaseMonitorMetrics) Init(superSpec *supervisor.Spec, super *supervisor.Supervisor) {
-	emm.superSpec, emm.spec, emm.super = superSpec, superSpec.ObjectSpec().(*Spec), super
+// Init initializes EaseMonitorMetrics.
+func (emm *EaseMonitorMetrics) Init(superSpec *supervisor.Spec) {
+	emm.superSpec, emm.spec, emm.super = superSpec, superSpec.ObjectSpec().(*Spec), superSpec.Super()
 	emm.reload()
 }
 
 // Inherit inherits previous generation of EaseMonitorMetrics.
-func (emm *EaseMonitorMetrics) Inherit(superSpec *supervisor.Spec,
-	previousGeneration supervisor.Object, super *supervisor.Supervisor) {
-
+func (emm *EaseMonitorMetrics) Inherit(superSpec *supervisor.Spec, previousGeneration supervisor.Object) {
 	previousGeneration.Close()
-	emm.Init(superSpec, super)
+	emm.Init(superSpec)
 }
 
 func (emm *EaseMonitorMetrics) reload() {
-	ssc, exists := emm.super.GetRunningObject((&statussynccontroller.StatusSyncController{}).Kind(),
-		supervisor.CategorySystemController)
+	ssc, exists := emm.super.GetSystemController(statussynccontroller.Kind)
 	if !exists {
 		logger.Errorf("BUG: status sync controller not found")
 	}
@@ -222,7 +218,7 @@ func (emm *EaseMonitorMetrics) getClient() (sarama.AsyncProducer, error) {
 				if !ok {
 					return
 				}
-				logger.Errorf("produce failed:", err)
+				logger.Errorf("produce failed: %v", err)
 			}
 		}
 	}()
@@ -251,9 +247,12 @@ func (emm *EaseMonitorMetrics) closeClient() {
 }
 
 func (emm *EaseMonitorMetrics) run() {
+	var latestTimestamp int64
+
 	for {
 		select {
 		case <-emm.done:
+			emm.closeClient()
 			return
 		case <-time.After(statussynccontroller.SyncStatusPaceInUnixSeconds * time.Second):
 			client, err := emm.getClient()
@@ -265,17 +264,14 @@ func (emm *EaseMonitorMetrics) run() {
 
 			records := emm.ssc.GetStatusesRecords()
 			for _, record := range records {
-				if record.UnixTimestmp <= emm.latestTimestamp {
+				if record.UnixTimestamp <= latestTimestamp {
 					continue
 				}
-				messages := emm.record2Messages(record)
+				latestTimestamp = record.UnixTimestamp
 
+				messages := emm.record2Messages(record)
 				for _, message := range messages {
 					client.Input() <- message
-				}
-
-				if err != nil {
-					emm.latestTimestamp = record.UnixTimestmp
 				}
 			}
 		}
@@ -288,7 +284,7 @@ func (emm *EaseMonitorMetrics) record2Messages(record *statussynccontroller.Stat
 
 	for objectName, status := range record.Statuses {
 		baseFields := &GlobalFields{
-			Timestamp: record.UnixTimestmp * 1000,
+			Timestamp: record.UnixTimestamp * 1000,
 			Category:  "application",
 			HostName:  emm.super.Options().Name,
 			HostIpv4:  hostIPv4,
@@ -297,12 +293,14 @@ func (emm *EaseMonitorMetrics) record2Messages(record *statussynccontroller.Stat
 		}
 
 		switch status := status.ObjectStatus.(type) {
-		case *httppipeline.Status:
-			reqs, codes := emm.httpPipeline2Metrics(baseFields, status)
+		case *trafficcontroller.HTTPServerStatus:
+			baseFields.Service = fmt.Sprintf("%s/%s", baseFields.Service, status.Spec["name"])
+			reqs, codes := emm.httpServer2Metrics(baseFields, status.Status)
 			reqMetrics = append(reqMetrics, reqs...)
 			codeMetrics = append(codeMetrics, codes...)
-		case *httpserver.Status:
-			reqs, codes := emm.httpServer2Metrics(baseFields, status)
+		case *trafficcontroller.HTTPPipelineStatus:
+			baseFields.Service = fmt.Sprintf("%s/%s", baseFields.Service, status.Spec["name"])
+			reqs, codes := emm.httpPipeline2Metrics(baseFields, status.Status)
 			reqMetrics = append(reqMetrics, reqs...)
 			codeMetrics = append(codeMetrics, codes...)
 		default:
@@ -338,10 +336,9 @@ func (emm *EaseMonitorMetrics) record2Messages(record *statussynccontroller.Stat
 	return messages
 }
 
-func (emm *EaseMonitorMetrics) httpPipeline2Metrics(
-	baseFields *GlobalFields, pipelineStatus *httppipeline.Status) (
-	reqMetrics []*RequestMetrics, codeMetrics []*StatusCodeMetrics) {
-
+func (emm *EaseMonitorMetrics) httpPipeline2Metrics(baseFields *GlobalFields, pipelineStatus *httppipeline.Status) (
+	reqMetrics []*RequestMetrics, codeMetrics []*StatusCodeMetrics,
+) {
 	for filterName, filterStatus := range pipelineStatus.Filters {
 		proxyStatus, ok := filterStatus.(*proxy.Status)
 		if !ok {
@@ -373,7 +370,6 @@ func (emm *EaseMonitorMetrics) httpPipeline2Metrics(
 			reqMetrics = append(reqMetrics, req)
 			codeMetrics = append(codeMetrics, codes...)
 		}
-
 	}
 
 	return
@@ -381,8 +377,8 @@ func (emm *EaseMonitorMetrics) httpPipeline2Metrics(
 
 func (emm *EaseMonitorMetrics) httpServer2Metrics(
 	baseFields *GlobalFields, serverStatus *httpserver.Status) (
-	reqMetrics []*RequestMetrics, codeMetrics []*StatusCodeMetrics) {
-
+	reqMetrics []*RequestMetrics, codeMetrics []*StatusCodeMetrics,
+) {
 	if serverStatus.Status != nil {
 		baseFieldsServer := *baseFields
 		baseFieldsServer.Resource = "SERVER"
@@ -404,8 +400,8 @@ func (emm *EaseMonitorMetrics) httpServer2Metrics(
 }
 
 func (emm *EaseMonitorMetrics) httpStat2Metrics(baseFields *GlobalFields, s *httpstat.Status) (
-	*RequestMetrics, []*StatusCodeMetrics) {
-
+	*RequestMetrics, []*StatusCodeMetrics,
+) {
 	baseFields.Type = "eg-http-request"
 	rm := &RequestMetrics{
 		GlobalFields: *baseFields,
@@ -469,10 +465,7 @@ func (emm *EaseMonitorMetrics) Status() *supervisor.Status {
 
 // Close closes EaseMonitorMetrics.
 func (emm *EaseMonitorMetrics) Close() {
-	// NOTE: close the channel first in case of
-	// using closed client in the run().
 	close(emm.done)
-	emm.closeClient()
 }
 
 func getHostIPv4() string {

@@ -20,9 +20,13 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"sort"
+	"sync"
 	"time"
 
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
+
+	"github.com/megaease/easegress/pkg/logger"
 )
 
 func aboutText() string {
@@ -41,61 +45,84 @@ const (
 	ConfigVersionKey = "X-Config-Version"
 )
 
-func (s *Server) setupAPIs() {
-	s.setupListAPIs()
-	s.setupMemberAPIs()
-	s.setupObjectAPIs()
-	s.setupMetadaAPIs()
-	s.setupHealthAPIs()
-	s.setupAboutAPIs()
+var (
+	apisMutex      = sync.Mutex{}
+	apis           = make(map[string]*Group)
+	apisChangeChan = make(chan struct{}, 10)
+
+	appendAddonAPIs []func(s *Server, group *Group)
+)
+
+type apisByOrder []*Group
+
+func (a apisByOrder) Less(i, j int) bool { return a[i].Group < a[j].Group }
+func (a apisByOrder) Len() int           { return len(a) }
+func (a apisByOrder) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+
+// RegisterAPIs registers global admin APIs.
+func RegisterAPIs(apiGroup *Group) {
+	apisMutex.Lock()
+	defer apisMutex.Unlock()
+
+	_, exists := apis[apiGroup.Group]
+	if exists {
+		logger.Errorf("group %s existed", apiGroup.Group)
+	}
+	apis[apiGroup.Group] = apiGroup
+
+	logger.Infof("register api group %s", apiGroup.Group)
+	apisChangeChan <- struct{}{}
 }
 
-func (s *Server) setupListAPIs() {
-	listAPIs := []*APIEntry{
+// UnregisterAPIs unregisters the API group.
+func UnregisterAPIs(group string) {
+	apisMutex.Lock()
+	defer apisMutex.Unlock()
+
+	_, exists := apis[group]
+	if !exists {
+		logger.Errorf("group %s not found", group)
+		return
+	}
+
+	delete(apis, group)
+
+	logger.Infof("unregister api group %s", group)
+	apisChangeChan <- struct{}{}
+}
+
+func (s *Server) registerAPIs() {
+	group := &Group{
+		Group: "admin",
+	}
+	group.Entries = append(group.Entries, s.listAPIEntries()...)
+	group.Entries = append(group.Entries, s.memberAPIEntries()...)
+	group.Entries = append(group.Entries, s.objectAPIEntries()...)
+	group.Entries = append(group.Entries, s.metadataAPIEntries()...)
+	group.Entries = append(group.Entries, s.healthAPIEntries()...)
+	group.Entries = append(group.Entries, s.aboutAPIEntries()...)
+	group.Entries = append(group.Entries, s.customDataAPIEntries()...)
+	group.Entries = append(group.Entries, s.profileAPIEntries()...)
+
+	for _, fn := range appendAddonAPIs {
+		fn(s, group)
+	}
+
+	RegisterAPIs(group)
+}
+
+func (s *Server) listAPIEntries() []*Entry {
+	return []*Entry{
 		{
 			Path:    "",
 			Method:  "GET",
 			Handler: s.listAPIs,
 		},
 	}
-
-	s.RegisterAPIs(listAPIs)
 }
 
-// RegisterAPIs registers APIs.
-func (s *Server) RegisterAPIs(apis []*APIEntry) {
-	s.apisMutex.Lock()
-	defer s.apisMutex.Unlock()
-
-	s.apis = append(s.apis, apis...)
-
-	for _, api := range apis {
-		api.Path = APIPrefix + api.Path
-		switch api.Method {
-		case "GET":
-			s.router.Get(api.Path, api.Handler)
-		case "HEAD":
-			s.router.Head(api.Path, api.Handler)
-		case "PUT":
-			s.router.Put(api.Path, api.Handler)
-		case "POST":
-			s.router.Post(api.Path, api.Handler)
-		case "PATCH":
-			s.router.Patch(api.Path, api.Handler)
-		case "DELETE":
-			s.router.Delete(api.Path, api.Handler)
-		case "CONNECT":
-			s.router.Connect(api.Path, api.Handler)
-		case "OPTIONS":
-			s.router.Options(api.Path, api.Handler)
-		case "TRACE":
-			s.router.Trace(api.Path, api.Handler)
-		}
-	}
-}
-
-func (s *Server) setupHealthAPIs() {
-	healthAPIs := []*APIEntry{
+func (s *Server) healthAPIEntries() []*Entry {
+	return []*Entry{
 		{
 			// https://stackoverflow.com/a/43381061/1705845
 			Path:    "/healthz",
@@ -103,12 +130,10 @@ func (s *Server) setupHealthAPIs() {
 			Handler: func(w http.ResponseWriter, r *http.Request) { /* 200 by default */ },
 		},
 	}
-
-	s.RegisterAPIs(healthAPIs)
 }
 
-func (s *Server) setupAboutAPIs() {
-	aboutAPIs := []*APIEntry{
+func (s *Server) aboutAPIEntries() []*Entry {
+	return []*Entry{
 		{
 			Path:   "/about",
 			Method: "GET",
@@ -118,19 +143,23 @@ func (s *Server) setupAboutAPIs() {
 			},
 		},
 	}
-
-	s.RegisterAPIs(aboutAPIs)
 }
 
 func (s *Server) listAPIs(w http.ResponseWriter, r *http.Request) {
-	s.apisMutex.RLock()
-	defer s.apisMutex.RUnlock()
+	apisMutex.Lock()
+	defer apisMutex.Unlock()
 
-	buff, err := yaml.Marshal(s.apis)
+	apiGroups := make([]*Group, 0, len(apis))
+	for _, group := range apis {
+		apiGroups = append(apiGroups, group)
+	}
+
+	sort.Sort(apisByOrder(apiGroups))
+
+	buff, err := yaml.Marshal(apiGroups)
 	if err != nil {
-		panic(fmt.Errorf("marshal %#v to yaml failed: %v", s.apis, err))
+		panic(fmt.Errorf("marshal %#v to yaml failed: %v", apiGroups, err))
 	}
 	w.Header().Set("Content-Type", "text/vnd.yaml")
 	w.Write(buff)
-	return
 }

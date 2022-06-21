@@ -23,7 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -507,12 +507,12 @@ func (ctx *SigningContext) hashBody(req *http.Request, verify bool) error {
 		// sha256 of empty string
 		ctx.BodyHash = sha256Empty
 	} else {
-		body, e := ioutil.ReadAll(req.Body)
+		body, e := io.ReadAll(req.Body)
 		if e != nil {
 			return e
 		}
 		req.Body.Close()
-		req.Body = ioutil.NopCloser(bytes.NewReader(body))
+		req.Body = io.NopCloser(bytes.NewReader(body))
 		ctx.BodyHash = sha256DegistAndEncodeToHexString(body)
 	}
 
@@ -689,11 +689,11 @@ func (ctx *SigningContext) initFromQuery(req *http.Request) error {
 	}
 
 	str = ctx.Query.Get(ctx.literal.Expires)
-	if v, e := strconv.ParseUint(str, 0, 64); e != nil {
+	v, e := strconv.ParseUint(str, 0, 64)
+	if e != nil {
 		return fmt.Errorf(invalidQuery, ctx.literal.Expires)
-	} else {
-		ctx.ExpireTime = time.Duration(v) * time.Second
 	}
+	ctx.ExpireTime = time.Duration(v) * time.Second
 
 	ctx.SignedHeaders = ctx.Query.Get(ctx.literal.SignedHeaders)
 	ctx.Signature = ctx.Query.Get(ctx.literal.Signature)

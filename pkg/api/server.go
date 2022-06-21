@@ -23,66 +23,70 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"go.uber.org/zap"
-
 	"github.com/megaease/easegress/pkg/cluster"
+	"github.com/megaease/easegress/pkg/cluster/customdata"
 	"github.com/megaease/easegress/pkg/logger"
 	"github.com/megaease/easegress/pkg/option"
+	pprof "github.com/megaease/easegress/pkg/profile"
+	"github.com/megaease/easegress/pkg/supervisor"
 )
 
 type (
 	// Server is the api server.
 	Server struct {
-		opt       option.Options
-		srv       http.Server
-		router    *chi.Mux
-		cluster   cluster.Cluster
-		apisMutex sync.RWMutex
-		apis      []*APIEntry
+		opt     *option.Options
+		server  http.Server
+		router  *dynamicMux
+		cluster cluster.Cluster
+		super   *supervisor.Supervisor
+		cds     *customdata.Store
+		profile pprof.Profile
 
 		mutex      cluster.Mutex
 		mutexMutex sync.Mutex
 	}
 
-	// APIEntry is the entry of API.
-	APIEntry struct {
+	// Group is the API group
+	Group struct {
+		Group   string
+		Entries []*Entry
+	}
+
+	// Entry is the entry of API.
+	Entry struct {
 		Path    string           `yaml:"path"`
 		Method  string           `yaml:"method"`
 		Handler http.HandlerFunc `yaml:"-"`
 	}
 )
 
-// GlobalServer is the global api server.
-var GlobalServer *Server
-
 // MustNewServer creates an api server.
-func MustNewServer(opt *option.Options, cluster cluster.Cluster) *Server {
-	r := chi.NewRouter()
-
+func MustNewServer(opt *option.Options, cls cluster.Cluster, super *supervisor.Supervisor, profile pprof.Profile) *Server {
 	s := &Server{
-		srv:     http.Server{Addr: opt.APIAddr, Handler: r},
-		router:  r,
-		cluster: cluster,
+		opt:     opt,
+		cluster: cls,
+		super:   super,
+		profile: profile,
 	}
-
-	r.Use(s.newAPILogger)
-	r.Use(s.newConfigVersionAttacher)
-	r.Use(s.newRecoverer)
+	s.router = newDynamicMux(s)
+	s.server = http.Server{Addr: opt.APIAddr, Handler: s.router}
 
 	_, err := s.getMutex()
 	if err != nil {
 		logger.Errorf("get cluster mutex %s failed: %v", lockKey, err)
 	}
 
-	s.setupAPIs()
+	kindPrefix := cls.Layout().CustomDataKindPrefix()
+	dataPrefix := cls.Layout().CustomDataPrefix()
+	s.cds = customdata.NewStore(cls, kindPrefix, dataPrefix)
+
+	s.initMetadata()
+	s.registerAPIs()
 
 	go func() {
 		logger.Infof("api server running in %s", opt.APIAddr)
-		s.srv.ListenAndServe()
+		s.server.ListenAndServe()
 	}()
-
-	GlobalServer = s
 
 	return s
 }
@@ -91,15 +95,16 @@ func MustNewServer(opt *option.Options, cluster cluster.Cluster) *Server {
 func (s *Server) Close(wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	// Give the server a bit to close connections
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := s.srv.Shutdown(ctx); err != nil {
-		logger.Errorf("Could not gracefully shutdown the server", zap.Error(err))
+	if err := s.server.Shutdown(ctx); err != nil {
+		logger.Errorf("gracefully shutdown the server failed: %v", err)
 	}
 
-	logger.Infof("Server stopped")
+	s.router.close()
+
+	logger.Infof("server stopped")
 }
 
 func (s *Server) getMutex() (cluster.Mutex, error) {

@@ -31,7 +31,6 @@ import (
 	"github.com/megaease/easegress/pkg/context"
 	"github.com/megaease/easegress/pkg/logger"
 	"github.com/megaease/easegress/pkg/object/httppipeline"
-	"github.com/megaease/easegress/pkg/supervisor"
 	"github.com/megaease/easegress/pkg/util/stringtool"
 )
 
@@ -43,9 +42,9 @@ const (
 	resultResponseAlready = "responseAlready"
 
 	// 64KB
-	maxBobyBytes = 64 * 1024
+	maxBodyBytes = 64 * 1024
 	// 192KB
-	maxContextBytes = 3 * maxBobyBytes
+	maxContextBytes = 3 * maxBodyBytes
 )
 
 var results = []string{resultFailed, resultResponseAlready}
@@ -72,7 +71,7 @@ var globalClient = &http.Client{
 			InsecureSkipVerify: true,
 		},
 		DisableCompression: false,
-		// NOTE: The large number of Idle Connctions can
+		// NOTE: The large number of Idle Connections can
 		// reduce overhead of building connections.
 		MaxIdleConns:          10240,
 		MaxIdleConnsPerHost:   512,
@@ -105,9 +104,8 @@ func (rf *RemoteFilter) Results() []string {
 type (
 	// RemoteFilter is the filter making remote service acting like internal filter.
 	RemoteFilter struct {
-		super    *supervisor.Supervisor
-		pipeSpec *httppipeline.FilterSpec
-		spec     *Spec
+		filterSpec *httppipeline.FilterSpec
+		spec       *Spec
 	}
 
 	// Spec describes RemoteFilter.
@@ -149,17 +147,15 @@ type (
 )
 
 // Init initializes RemoteFilter.
-func (rf *RemoteFilter) Init(pipeSpec *httppipeline.FilterSpec, super *supervisor.Supervisor) {
-	rf.pipeSpec, rf.spec, rf.super = pipeSpec, pipeSpec.FilterSpec().(*Spec), super
+func (rf *RemoteFilter) Init(filterSpec *httppipeline.FilterSpec) {
+	rf.filterSpec, rf.spec = filterSpec, filterSpec.FilterSpec().(*Spec)
 	rf.reload()
 }
 
 // Inherit inherits previous generation of RemoteFilter.
-func (rf *RemoteFilter) Inherit(pipeSpec *httppipeline.FilterSpec,
-	previousGeneration httppipeline.Filter, super *supervisor.Supervisor) {
-
+func (rf *RemoteFilter) Inherit(filterSpec *httppipeline.FilterSpec, previousGeneration httppipeline.Filter) {
 	previousGeneration.Close()
-	rf.Init(pipeSpec, super)
+	rf.Init(filterSpec)
 }
 
 func (rf *RemoteFilter) reload() {
@@ -211,10 +207,10 @@ func (rf *RemoteFilter) handle(ctx context.HTTPContext) (result string) {
 	}()
 
 	errPrefix = "read request body"
-	reqBody := rf.limitRead(r.Body(), maxBobyBytes)
+	reqBody := rf.limitRead(r.Body(), maxBodyBytes)
 
 	errPrefix = "read response body"
-	respBody := rf.limitRead(w.Body(), maxBobyBytes)
+	respBody := rf.limitRead(w.Body(), maxBodyBytes)
 
 	errPrefix = "marshal context"
 	ctxBuff := rf.marshalHTTPContext(ctx, reqBody, respBody)
@@ -313,7 +309,7 @@ func (rf *RemoteFilter) unmarshalHTTPContext(buff []byte, ctx context.HTTPContex
 	r.SetPath(re.Path)
 	r.SetQuery(re.Query)
 	r.Header().Reset(re.Header)
-	r.SetBody(bytes.NewReader(re.Body))
+	r.SetBody(bytes.NewReader(re.Body), true)
 
 	if we == nil {
 		return

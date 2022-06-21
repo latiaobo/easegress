@@ -19,16 +19,21 @@ package proxy
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/megaease/easegress/pkg/context"
+	"github.com/megaease/easegress/pkg/logger"
 	"github.com/megaease/easegress/pkg/object/httppipeline"
-	"github.com/megaease/easegress/pkg/supervisor"
+	"github.com/megaease/easegress/pkg/tracing"
 	"github.com/megaease/easegress/pkg/util/fallback"
+	zipkinhttp "github.com/openzipkin/zipkin-go/middleware/http"
 )
 
 const (
@@ -36,7 +41,7 @@ const (
 	Kind = "Proxy"
 
 	resultFallback      = "fallback"
-	resultInternalError = "interalError"
+	resultInternalError = "internalError"
 	resultClientError   = "clientError"
 	resultServerError   = "serverError"
 )
@@ -52,43 +57,15 @@ func init() {
 	httppipeline.Register(&Proxy{})
 }
 
-// All Proxy instances use one globalClient in order to reuse
-// some resounces such as keepalive connections.
-var globalClient = &http.Client{
-	// NOTE: Timeout could be no limit, real client or server could cancel it.
-	Timeout: 0,
-	Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 60 * time.Second,
-			DualStack: true,
-		}).DialContext,
-		TLSClientConfig: &tls.Config{
-			// NOTE: Could make it an paramenter,
-			// when the requests need cross WAN.
-			InsecureSkipVerify: true,
-		},
-		DisableCompression: false,
-		// NOTE: The large number of Idle Connctions can
-		// reduce overhead of building connections.
-		MaxIdleConns:          10240,
-		MaxIdleConnsPerHost:   512,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	},
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
+var fnSendRequest = func(r *http.Request, client *Client) (*http.Response, error) {
+	return client.Do(r)
 }
 
 type (
 	// Proxy is the filter Proxy.
 	Proxy struct {
-		super    *supervisor.Supervisor
-		pipeSpec *httppipeline.FilterSpec
-		spec     *Spec
+		filterSpec *httppipeline.FilterSpec
+		spec       *Spec
 
 		fallback *fallback.Fallback
 
@@ -96,19 +73,29 @@ type (
 		candidatePools []*pool
 		mirrorPool     *pool
 
+		client atomic.Value //*Client
+
 		compression *compression
+	}
+
+	// Client is a wrapper around http.Client.
+	Client struct {
+		client       *http.Client
+		zipkinClient *zipkinhttp.Client
+		tracing      *tracing.Tracing
 	}
 
 	// Spec describes the Proxy.
 	Spec struct {
-		httppipeline.FilterMetaSpec `yaml:",inline"`
-
-		Fallback       *FallbackSpec    `yaml:"fallback,omitempty" jsonschema:"omitempty"`
-		MainPool       *PoolSpec        `yaml:"mainPool" jsonschema:"required"`
-		CandidatePools []*PoolSpec      `yaml:"candidatePools,omitempty" jsonschema:"omitempty"`
-		MirrorPool     *PoolSpec        `yaml:"mirrorPool,omitempty" jsonschema:"omitempty"`
-		FailureCodes   []int            `yaml:"failureCodes" jsonschema:"omitempty,uniqueItems=true,format=httpcode-array"`
-		Compression    *CompressionSpec `yaml:"compression,omitempty" jsonschema:"omitempty"`
+		Fallback            *FallbackSpec    `yaml:"fallback,omitempty" jsonschema:"omitempty"`
+		MainPool            *PoolSpec        `yaml:"mainPool" jsonschema:"required"`
+		CandidatePools      []*PoolSpec      `yaml:"candidatePools,omitempty" jsonschema:"omitempty"`
+		MirrorPool          *PoolSpec        `yaml:"mirrorPool,omitempty" jsonschema:"omitempty"`
+		FailureCodes        []int            `yaml:"failureCodes" jsonschema:"omitempty,uniqueItems=true,format=httpcode-array"`
+		Compression         *CompressionSpec `yaml:"compression,omitempty" jsonschema:"omitempty"`
+		MTLS                *MTLS            `yaml:"mtls,omitempty" jsonschema:"omitempty"`
+		MaxIdleConns        int              `yaml:"maxIdleConns" jsonschema:"omitempty"`
+		MaxIdleConnsPerHost int              `yaml:"maxIdleConnsPerHost" jsonschema:"omitempty"`
 	}
 
 	// FallbackSpec describes the fallback policy.
@@ -120,10 +107,35 @@ type (
 	// Status is the status of Proxy.
 	Status struct {
 		MainPool       *PoolStatus   `yaml:"mainPool"`
-		CandidatePools []*PoolStatus `yaml:"candidatePool,omitempty"`
+		CandidatePools []*PoolStatus `yaml:"candidatePools,omitempty"`
 		MirrorPool     *PoolStatus   `yaml:"mirrorPool,omitempty"`
 	}
+
+	// MTLS is the configuration for client side mTLS.
+	MTLS struct {
+		CertBase64     string `yaml:"certBase64" jsonschema:"required,format=base64"`
+		KeyBase64      string `yaml:"keyBase64" jsonschema:"required,format=base64"`
+		RootCertBase64 string `yaml:"rootCertBase64" jsonschema:"required,format=base64"`
+	}
 )
+
+// NewClient creates a wrapper around http.Client
+func NewClient(cl *http.Client, tr *tracing.Tracing) *Client {
+	var zClient *zipkinhttp.Client
+	if tr != nil && tr != tracing.NoopTracing {
+		tracer := tr.Tracer
+		zClient, _ = zipkinhttp.NewClient(tracer, zipkinhttp.WithClient(cl))
+	}
+	return &Client{client: cl, zipkinClient: zClient, tracing: tr}
+}
+
+// Do calls the correct http client
+func (c *Client) Do(r *http.Request) (*http.Response, error) {
+	if c.zipkinClient != nil {
+		return c.zipkinClient.DoWithAppSpan(r, r.URL.Path)
+	}
+	return c.client.Do(r)
+}
 
 // Validate validates Spec.
 func (s Spec) Validate() error {
@@ -169,7 +181,10 @@ func (b *Proxy) Kind() string {
 
 // DefaultSpec returns the default spec of Proxy.
 func (b *Proxy) DefaultSpec() interface{} {
-	return &Spec{}
+	return &Spec{
+		MaxIdleConns:        10240,
+		MaxIdleConnsPerHost: 1024,
+	}
 }
 
 // Description returns the description of Proxy.
@@ -183,21 +198,53 @@ func (b *Proxy) Results() []string {
 }
 
 // Init initializes Proxy.
-func (b *Proxy) Init(pipeSpec *httppipeline.FilterSpec, super *supervisor.Supervisor) {
-	b.pipeSpec, b.spec, b.super = pipeSpec, pipeSpec.FilterSpec().(*Spec), super
+func (b *Proxy) Init(filterSpec *httppipeline.FilterSpec) {
+	b.filterSpec, b.spec = filterSpec, filterSpec.FilterSpec().(*Spec)
+
 	b.reload()
 }
 
 // Inherit inherits previous generation of Proxy.
-func (b *Proxy) Inherit(pipeSpec *httppipeline.FilterSpec,
-	previousGeneration httppipeline.Filter, super *supervisor.Supervisor) {
-
+func (b *Proxy) Inherit(filterSpec *httppipeline.FilterSpec, previousGeneration httppipeline.Filter) {
 	previousGeneration.Close()
-	b.Init(pipeSpec, super)
+	b.Init(filterSpec)
+}
+
+func (b *Proxy) needmTLS() bool {
+	return b.spec.MTLS != nil
+}
+
+func (b *Proxy) tlsConfig() *tls.Config {
+	if !b.needmTLS() {
+		return &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+	rootCertPem, _ := base64.StdEncoding.DecodeString(b.spec.MTLS.RootCertBase64)
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(rootCertPem)
+
+	var certificates []tls.Certificate
+	certPem, _ := base64.StdEncoding.DecodeString(b.spec.MTLS.CertBase64)
+	keyPem, _ := base64.StdEncoding.DecodeString(b.spec.MTLS.KeyBase64)
+	cert, err := tls.X509KeyPair(certPem, keyPem)
+	if err != nil {
+		logger.Errorf("proxy generates x509 key pair failed: %v", err)
+		return &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+	certificates = append(certificates, cert)
+	return &tls.Config{
+		Certificates: certificates,
+		RootCAs:      caCertPool,
+	}
 }
 
 func (b *Proxy) reload() {
-	b.mainPool = newPool(b.spec.MainPool, "proxy#main",
+	super := b.filterSpec.Super()
+
+	b.mainPool = newPool(super, b.spec.MainPool, "proxy#main",
 		true /*writeResponse*/, b.spec.FailureCodes)
 
 	if b.spec.Fallback != nil {
@@ -207,18 +254,48 @@ func (b *Proxy) reload() {
 	if len(b.spec.CandidatePools) > 0 {
 		var candidatePools []*pool
 		for k := range b.spec.CandidatePools {
-			candidatePools = append(candidatePools, newPool(b.spec.CandidatePools[k], fmt.Sprintf("backedn#candidate#%d", k),
-				true, b.spec.FailureCodes))
+			candidatePools = append(candidatePools,
+				newPool(super, b.spec.CandidatePools[k], fmt.Sprintf("proxy#candidate#%d", k),
+					true, b.spec.FailureCodes))
 		}
 		b.candidatePools = candidatePools
 	}
 	if b.spec.MirrorPool != nil {
-		b.mirrorPool = newPool(b.spec.MirrorPool, "proxy#mirror",
+		b.mirrorPool = newPool(super, b.spec.MirrorPool, "proxy#mirror",
 			false /*writeResponse*/, b.spec.FailureCodes)
 	}
 
 	if b.spec.Compression != nil {
-		b.compression = newcompression(b.spec.Compression)
+		b.compression = newCompression(b.spec.Compression)
+	}
+
+	b.client.Store(NewClient(b.createHTTPClient() /*tracing=*/, nil))
+}
+
+func (b *Proxy) createHTTPClient() *http.Client {
+	return &http.Client{
+		// NOTE: Timeout could be no limit, real client or server could cancel it.
+		Timeout: 0,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 60 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			TLSClientConfig:    b.tlsConfig(),
+			DisableCompression: false,
+			// NOTE: The large number of Idle Connections can
+			// reduce overhead of building connections.
+			MaxIdleConns:          b.spec.MaxIdleConns,
+			MaxIdleConnsPerHost:   b.spec.MaxIdleConnsPerHost,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }
 
@@ -266,30 +343,52 @@ func (b *Proxy) fallbackForCodes(ctx context.HTTPContext) bool {
 }
 
 // Handle handles HTTPContext.
+// When we create new request for backend, we call http.NewRequestWithContext method and use context.Request().Body() as body.
+// Based on golang std lib comments:
+// https://github.com/golang/go/blob/95b68e1e02fa713719f02f6c59fb1532bd05e824/src/net/http/request.go#L856-L860
+// If body is of type *bytes.Buffer, *bytes.Reader, or
+// *strings.Reader, the returned request's ContentLength is set to its
+// exact value (instead of -1), GetBody is populated (so 307 and 308
+// redirects can replay the body), and Body is set to NoBody if the
+// ContentLength is 0.
+//
+// So in this way, http.Request.ContentLength will be 0, and when http.Client send this request, it will delete
+// "Content-Length" key in header. We solve this problem by set http.Request.ContentLength equal to
+// http.Request.Header["Content-Length"] (if it is presented).
+// Reading all context.Request().Body() and create new request with bytes.NewReader is another way, but it may cause performance loss.
+//
+// It is important that "Content-Length" in the Header is equal to the length of the Body. In easegress, when a filter change Request.Body,
+// it will delete the header of "Content-Length". So, you should not worry about this when using our filters.
+// But for customer filters, developer should make sure to delete or set "Context-Length" value in header when change Request.Body.
 func (b *Proxy) Handle(ctx context.HTTPContext) (result string) {
 	result = b.handle(ctx)
 	return ctx.CallNextHandler(result)
 }
 
+func (b *Proxy) updateAndGetClient(tracingInstance *tracing.Tracing) *Client {
+	client := b.client.Load().(*Client)
+	if client.tracing == tracingInstance {
+		return client
+	}
+	// tracingInstance is updated so recreate http.Client
+	newClient := NewClient(b.createHTTPClient(), tracingInstance)
+	b.client.Store(newClient)
+	return newClient
+}
+
 func (b *Proxy) handle(ctx context.HTTPContext) (result string) {
 	if b.mirrorPool != nil && b.mirrorPool.filter.Filter(ctx) {
-		master, slave := newMasterSlaveReader(ctx.Request().Body())
-		ctx.Request().SetBody(master)
+		primaryBody, secondaryBody := newPrimarySecondaryReader(ctx.Request().Body())
+		ctx.Request().SetBody(primaryBody, false)
 
 		wg := &sync.WaitGroup{}
 		wg.Add(1)
-		defer func() {
-			if result == "" {
-				// NOTE: Waiting for mirrorPool finishing
-				// only if mainPool/candidatePool handled
-				// with normal result.
-				wg.Wait()
-			}
-		}()
+		defer wg.Wait()
 
 		go func() {
 			defer wg.Done()
-			b.mirrorPool.handle(ctx, slave)
+			client := b.updateAndGetClient(ctx.Tracing())
+			b.mirrorPool.handle(ctx, secondaryBody, client)
 		}()
 	}
 
@@ -311,13 +410,13 @@ func (b *Proxy) handle(ctx context.HTTPContext) (result string) {
 		return ""
 	}
 
-	result = p.handle(ctx, ctx.Request().Body())
+	client := b.updateAndGetClient(ctx.Tracing())
+	result = p.handle(ctx, ctx.Request().Body(), client)
 	if result != "" {
+		if b.fallbackForCodes(ctx) {
+			return resultFallback
+		}
 		return result
-	}
-
-	if b.fallbackForCodes(ctx) {
-		return resultFallback
 	}
 
 	// compression and memoryCache only work for

@@ -119,9 +119,9 @@ func NewHTTPTemplate(filterBuffs []FilterBuff) (*HTTPTemplate, error) {
 	filterFuncTags := map[string][]string{}
 	// validates the filter's YAML spec for dependency checking
 	// and template format,e.g., if filter1 has a template said '[[filter.filter2.rsp.data]],
-	// but it appears before filter2, then it's an invalidate dependency cause we can't get
+	// but it appears before filter2, then it's an invalidated dependency cause we can't get
 	// the rsp form filter2 in the execution period of filter1. At last it will build up
-	// executing function arraies for every filters.
+	// executing function arrays for every filter.
 	for _, filterBuff := range filterBuffs {
 		e.filtersOrder = append(e.filtersOrder, filterBuff.Name)
 		templatesMap := e.Engine.ExtractRawTemplateRuleMap(string(filterBuff.Buff))
@@ -136,7 +136,7 @@ func NewHTTPTemplate(filterBuffs []FilterBuff) (*HTTPTemplate, error) {
 				break
 			}
 
-			tags := strings.Split(renderMeta, texttemplate.DefaultSepertor)
+			tags := strings.Split(renderMeta, texttemplate.DefaultSeparator)
 			if len(tags) < defaultTagNum {
 				err = fmt.Errorf("filter %s template [[%s]] check failed,its render metaTemplate [[%s]] is invalid",
 					filterBuff.Name, template, renderMeta)
@@ -144,7 +144,7 @@ func NewHTTPTemplate(filterBuffs []FilterBuff) (*HTTPTemplate, error) {
 			} else {
 				dependFilterName := tags[filterNameTagIndex]
 				dependFilters = append(dependFilters, dependFilterName)
-				funcTag := tags[filterReqRspTagIndex] + texttemplate.DefaultSepertor +
+				funcTag := tags[filterReqRspTagIndex] + texttemplate.DefaultSeparator +
 					tags[filterValueTagIndex]
 
 				funcTags := filterFuncTags[dependFilterName]
@@ -175,26 +175,24 @@ func NewHTTPTemplate(filterBuffs []FilterBuff) (*HTTPTemplate, error) {
 	return &e, nil
 }
 
-// NewHTTPTemplateDummy return a empty implement version of HTTP template
-func NewHTTPTemplateDummy() *HTTPTemplate {
-	return &HTTPTemplate{
-		Engine:          texttemplate.NewDummyTemplate(),
-		filterExecFuncs: map[string]filterDictFuncs{},
-	}
-}
-
 func readBody(body io.Reader, maxBodySize int64) (*bytes.Buffer, error) {
 	buff := bytes.NewBuffer(nil)
-	written, err := io.CopyN(buff, body, defaultMaxBodySize+1)
+	if body == nil {
+		return buff, nil
+	}
+
+	written, err := io.Copy(buff, body)
 
 	if err != nil && err != io.EOF {
 		err = fmt.Errorf("read body failed: %v", err)
 		return nil, err
 	}
 
-	if written > defaultMaxBodySize {
-		err = fmt.Errorf("body exceed %dB", defaultMaxBodySize)
-		return nil, err
+	if written > maxBodySize {
+		logger.Warnf(
+			"body size was over %dB (was %dB), causing potentially decreased performance",
+			maxBodySize,
+			written)
 	}
 
 	return buff, nil
@@ -225,7 +223,7 @@ func (e *HTTPTemplate) SaveRequest(filterName string, ctx HTTPContext) error {
 	return nil
 }
 
-// SaveResponse transforms HTTPResonse related fields into template engine's dictionary
+// SaveResponse transforms HTTPResponse related fields into template engine's dictionary
 func (e *HTTPTemplate) SaveResponse(filterName string, ctx HTTPContext) error {
 	var (
 		execFuncs filterDictFuncs
@@ -334,7 +332,7 @@ func saveReqBody(e *HTTPTemplate, filterName string, ctx HTTPContext) error {
 	}
 	e.Engine.SetDict(fmt.Sprintf(filterReqBody, filterName), string(bodyBuff.Bytes()))
 	// Reset back into Request's Body
-	ctx.Request().SetBody(bodyBuff)
+	ctx.Request().SetBody(bodyBuff, true)
 
 	return nil
 }

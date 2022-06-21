@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/dgrijalva/jwt-go"
+	"github.com/golang-jwt/jwt"
 
 	"github.com/megaease/easegress/pkg/context"
 )
@@ -67,7 +67,7 @@ func (v *JWTValidator) Validate(req context.HTTPRequest) error {
 		const prefix = "Bearer "
 		authHdr := req.Header().Get("Authorization")
 		if !strings.HasPrefix(authHdr, prefix) {
-			return fmt.Errorf("unexpected authrization header: %s", authHdr)
+			return fmt.Errorf("unexpected authorization header: %s", authHdr)
 		}
 		token = authHdr[len(prefix):]
 	}

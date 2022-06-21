@@ -6,7 +6,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://wwwrk.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -27,26 +27,26 @@ const (
 	// meshEurekaPrefix is the mesh eureka registry API url prefix.
 	meshEurekaPrefix = "/mesh/eureka"
 
-	// meshNacosPrefix is the mesh nacos registyr API url prefix.
+	// meshNacosPrefix is the mesh nacos registry API url prefix.
 	meshNacosPrefix = "/nacos/v1"
 )
 
-func (wrk *Worker) runAPIServer() {
+func (worker *Worker) runAPIServer() {
 	var apis []*apiEntry
-	switch wrk.registryServer.RegistryType {
+	switch worker.registryServer.RegistryType {
 	case spec.RegistryTypeConsul:
-		apis = wrk.consulAPIs()
+		apis = worker.consulAPIs()
 	case spec.RegistryTypeEureka:
-		apis = wrk.eurekaAPIs()
+		apis = worker.eurekaAPIs()
 	case spec.RegistryTypeNacos:
-		apis = wrk.nacosAPIs()
+		apis = worker.nacosAPIs()
 	default:
-		apis = wrk.eurekaAPIs()
+		apis = worker.eurekaAPIs()
 	}
-	wrk.apiServer.registerAPIs(apis)
+	worker.apiServer.registerAPIs(apis)
 }
 
-func (wrk *Worker) emptyHandler(w http.ResponseWriter, r *http.Request) {
+func (worker *Worker) emptyHandler(w http.ResponseWriter, r *http.Request) {
 	// EaseMesh does not need to implement some APIS like
 	// delete, heartbeat of Eureka/Consul/Nacos.
 }

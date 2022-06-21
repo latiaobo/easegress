@@ -27,15 +27,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
-
 	"github.com/megaease/easegress/pkg/logger"
 	"github.com/megaease/easegress/pkg/tracing"
+	"github.com/megaease/easegress/pkg/util/fasttime"
 	"github.com/megaease/easegress/pkg/util/httpheader"
 	"github.com/megaease/easegress/pkg/util/httpstat"
 	"github.com/megaease/easegress/pkg/util/stringtool"
 	"github.com/megaease/easegress/pkg/util/texttemplate"
-	"github.com/megaease/easegress/pkg/util/timetool"
 )
 
 type (
@@ -46,25 +44,22 @@ type (
 	// It is not goroutine-safe, callers must use Lock/Unlock
 	// to protect it by themselves.
 	HTTPContext interface {
+		Context
 		Lock()
 		Unlock()
 
-		Span() tracing.Span
-
 		Request() HTTPRequest
-		Response() HTTPReponse
+		Response() HTTPResponse
 
-		stdcontext.Context
 		Cancel(err error)
 		Cancelled() bool
 		ClientDisconnected() bool
 
-		Duration() time.Duration // For log, sample, etc.
-		OnFinish(func())         // For setting final client statistics, etc.
-		AddTag(tag string)       // For debug, log, etc.
+		OnFinish(FinishFunc)    // For setting final client statistics, etc.
+		AddTag(tag string)      // For debug, log, etc.
+		AddLazyTag(LazyTagFunc) // Return LazyTags as strings.
 
 		StatMetric() *httpstat.Metric
-		Log() string
 
 		Finish()
 
@@ -75,6 +70,8 @@ type (
 
 		CallNextHandler(lastResult string) string
 		SetHandlerCaller(caller HandlerCaller)
+
+		Tracing() *tracing.Tracing
 	}
 
 	// HTTPRequest is all operations for HTTP request.
@@ -103,15 +100,15 @@ type (
 		AddCookie(cookie *http.Cookie)
 
 		Body() io.Reader
-		SetBody(io.Reader)
+		SetBody(io.Reader, bool)
 
 		Std() *http.Request
 
 		Size() uint64 // bytes
 	}
 
-	// HTTPReponse is all operations for HTTP response.
-	HTTPReponse interface {
+	// HTTPResponse is all operations for HTTP response.
+	HTTPResponse interface {
 		StatusCode() int // Default is 200
 		SetStatusCode(code int)
 
@@ -120,36 +117,49 @@ type (
 
 		SetBody(body io.Reader)
 		Body() io.Reader
-		OnFlushBody(func(body []byte, complete bool) (newBody []byte))
+		OnFlushBody(BodyFlushFunc)
 
 		Std() http.ResponseWriter
 
 		Size() uint64 // bytes
 	}
 
+	// HTTPResult is result for handling http request
+	HTTPResult struct {
+		Err error
+	}
+
 	// FinishFunc is the type of function to be called back
 	// when HTTPContext is finishing.
 	FinishFunc = func()
 
+	// BodyFlushFunc is the type of function to be called back
+	// when body is flushing.
+	BodyFlushFunc = func(body []byte, complete bool) (newBody []byte)
+
+	// LazyTagFunc is the type of function to be called back
+	// when converting lazy tags to strings.
+	LazyTagFunc = func() string
+
 	httpContext struct {
 		mutex sync.Mutex
 
-		startTime   *time.Time
-		endTime     *time.Time
+		startTime   time.Time
 		finishFuncs []FinishFunc
-		tags        []string
+		lazyTags    []LazyTagFunc
 		caller      HandlerCaller
 
 		r *httpRequest
 		w *httpResponse
 
 		ht             *HTTPTemplate
-		tracer         opentracing.Tracer
-		span           tracing.Span
 		originalReqCtx stdcontext.Context
 		stdctx         stdcontext.Context
 		cancelFunc     stdcontext.CancelFunc
 		err            error
+
+		metric  httpstat.Metric
+		tracing *tracing.Tracing
 	}
 )
 
@@ -157,23 +167,36 @@ type (
 // NOTE: We can't use sync.Pool to recycle context.
 // Reference: https://github.com/gin-gonic/gin/issues/1731
 func New(stdw http.ResponseWriter, stdr *http.Request,
-	tracer *tracing.Tracing, spanName string) HTTPContext {
+	tracingInstance *tracing.Tracing, spanName string) HTTPContext {
 	originalReqCtx := stdr.Context()
 	stdctx, cancelFunc := stdcontext.WithCancel(originalReqCtx)
 	stdr = stdr.WithContext(stdctx)
-
-	startTime := time.Now()
-	return &httpContext{
-		startTime:      &startTime,
-		tracer:         tracer,
-		span:           tracing.NewSpan(tracer, spanName),
+	startTime := fasttime.Now()
+	if !tracingInstance.IsNoopTracer() {
+		// add span to context
+		stdctx = tracing.CreateSpanWithContext(stdctx, tracingInstance, spanName, startTime)
+	}
+	ctx := &httpContext{
+		startTime:      startTime,
 		originalReqCtx: originalReqCtx,
 		stdctx:         stdctx,
 		cancelFunc:     cancelFunc,
 		r:              newHTTPRequest(stdr),
 		w:              newHTTPResponse(stdw, stdr),
-		ht:             NewHTTPTemplateDummy(),
+		lazyTags:       make([]LazyTagFunc, 0, 5),
+		finishFuncs:    make([]FinishFunc, 0, 1),
+		tracing:        tracingInstance,
 	}
+	return ctx
+}
+
+// NewEmptyContext for testing.
+func NewEmptyContext() HTTPContext {
+	return &httpContext{}
+}
+
+func (ctx *httpContext) Protocol() Protocol {
+	return HTTP
 }
 
 func (ctx *httpContext) CallNextHandler(lastResult string) string {
@@ -192,19 +215,32 @@ func (ctx *httpContext) Unlock() {
 	ctx.mutex.Unlock()
 }
 
-func (ctx *httpContext) Span() tracing.Span {
-	return ctx.span
+// Add new Tag.
+func (ctx *httpContext) AddTag(tag string) {
+	ctx.lazyTags = append(ctx.lazyTags, func() string {
+		return tag
+	})
 }
 
-func (ctx *httpContext) AddTag(tag string) {
-	ctx.tags = append(ctx.tags, tag)
+// Add new LazyTag.
+func (ctx *httpContext) AddLazyTag(lazyTag LazyTagFunc) {
+	ctx.lazyTags = append(ctx.lazyTags, lazyTag)
+}
+
+// Return all tags in string format.
+func (ctx *httpContext) getTags() []string {
+	tags := make([]string, len(ctx.lazyTags))
+	for i := 0; i < len(ctx.lazyTags); i++ {
+		tags[i] = ctx.lazyTags[i]()
+	}
+	return tags
 }
 
 func (ctx *httpContext) Request() HTTPRequest {
 	return ctx.r
 }
 
-func (ctx *httpContext) Response() HTTPReponse {
+func (ctx *httpContext) Response() HTTPResponse {
 	return ctx.w
 }
 
@@ -244,14 +280,6 @@ func (ctx *httpContext) Cancelled() bool {
 	return ctx.err != nil || ctx.stdctx.Err() != nil
 }
 
-func (ctx *httpContext) Duration() time.Duration {
-	if ctx.endTime != nil {
-		return ctx.endTime.Sub(*ctx.startTime)
-	}
-
-	return time.Now().Sub(*ctx.startTime)
-}
-
 func (ctx *httpContext) ClientDisconnected() bool {
 	return ctx.originalReqCtx.Err() != nil
 }
@@ -266,8 +294,10 @@ func (ctx *httpContext) Finish() {
 	ctx.r.finish()
 	ctx.w.finish()
 
-	endTime := time.Now()
-	ctx.endTime = &endTime
+	ctx.metric.StatusCode = ctx.Response().StatusCode()
+	ctx.metric.Duration = fasttime.Now().Sub(ctx.startTime)
+	ctx.metric.ReqSize = ctx.Request().Size()
+	ctx.metric.RespSize = ctx.Response().Size()
 
 	for _, fn := range ctx.finishFuncs {
 		func() {
@@ -282,47 +312,38 @@ func (ctx *httpContext) Finish() {
 		}()
 	}
 
-	logger.HTTPAccess(ctx.Log())
+	logger.LazyHTTPAccess(func() string {
+		stdr := ctx.r.std
+		tags := strings.Join(ctx.getTags(), " | ")
+
+		// log format:
+		// [startTime]
+		// [requestInfo]
+		// [contextStatistics]
+		// [tags]
+		//
+		// [$startTime]
+		// [$remoteAddr $realIP $method $requestURL $proto $statusCode]
+		// [$contextDuration $readBytes $writeBytes]
+		// [$tags]
+		return fmt.Sprintf("[%s] [%s %s %s %s %s %d] [%v rx:%dB tx:%dB] [%s]",
+			fasttime.Format(ctx.startTime, fasttime.RFC3339Milli),
+			stdr.RemoteAddr, ctx.r.RealIP(), stdr.Method, stdr.RequestURI, stdr.Proto, ctx.w.code,
+			ctx.metric.Duration, ctx.r.Size(), ctx.w.Size(),
+			tags)
+	})
 }
 
 func (ctx *httpContext) StatMetric() *httpstat.Metric {
-	return &httpstat.Metric{
-		StatusCode: ctx.Response().StatusCode(),
-		Duration:   ctx.Duration(),
-		ReqSize:    ctx.Request().Size(),
-		RespSize:   ctx.Response().Size(),
-	}
+	return &ctx.metric
 }
 
-func (ctx *httpContext) Log() string {
-	stdr := ctx.r.std
-
-	// log format:
-	// [startTime]
-	// [requestInfo]
-	// [contextStatistics]
-	// [tags]
-	//
-	// [$startTime]
-	// [$remoteAddr $realIP $method $requestURL $proto $statusCode]
-	// [$contextDuration $readBytes $writeBytes]
-	// [$tags]
-	return fmt.Sprintf("[%s] "+
-		"[%s %s %s %s %s %d] "+
-		"[%v rx:%dB tx:%dB] "+
-		"[%s]",
-		ctx.startTime.Format(timetool.RFC3339Milli),
-		stdr.RemoteAddr, ctx.r.RealIP(), stdr.Method, stdr.RequestURI, stdr.Proto, ctx.w.code,
-		ctx.Duration(), ctx.r.Size(), ctx.w.Size(),
-		strings.Join(ctx.tags, " | "))
-}
-
-// Template returns HTTPTemplate rely interface
+// Template returns the template engine
 func (ctx *httpContext) Template() texttemplate.TemplateEngine {
 	return ctx.ht.Engine
 }
 
-// SetTempalte sets the http template initinaled by other module
+// SetTemplate sets the http template initinaled by other module
 func (ctx *httpContext) SetTemplate(ht *HTTPTemplate) {
 	ctx.ht = ht
 }
@@ -335,4 +356,9 @@ func (ctx *httpContext) SaveReqToTemplate(filterName string) error {
 // SaveRspToTemplate stores http response related info into HTTP template engine
 func (ctx *httpContext) SaveRspToTemplate(filterName string) error {
 	return ctx.ht.SaveResponse(filterName, ctx)
+}
+
+// Tracing returns tracing object
+func (ctx *httpContext) Tracing() *tracing.Tracing {
+	return ctx.tracing
 }

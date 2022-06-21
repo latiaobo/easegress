@@ -20,7 +20,6 @@ package cluster
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,7 +53,7 @@ type (
 		KnownMembers   *membersSlice `yaml:"knownMembers"`
 	}
 
-	// membersSlice carrys unique members whose PeerURL is the primary id.
+	// membersSlice carries unique members whose PeerURL is the primary id.
 	membersSlice []*member
 
 	member struct {
@@ -73,9 +72,19 @@ func newMembers(opt *option.Options) (*members, error) {
 		ClusterMembers: newMemberSlices(),
 		KnownMembers:   newMemberSlices(),
 	}
+	m.initializeMembers(opt)
+	err := m.load()
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
 
+// initializeMembers adds first member to ClusterMembers and all members to KnownMembers.
+func (m *members) initializeMembers(opt *option.Options) {
 	initMS := make(membersSlice, 0)
-	if opt.ClusterRole == "writer" && len(opt.ClusterInitialAdvertisePeerURLs) != 0 {
+	if opt.ClusterRole == "primary" && len(opt.ClusterInitialAdvertisePeerURLs) != 0 {
+		// Cluster is started member by member --> start with cluster of size 1
 		initMS = append(initMS, &member{
 			Name:    opt.Name,
 			PeerURL: opt.ClusterInitialAdvertisePeerURLs[0],
@@ -83,6 +92,7 @@ func newMembers(opt *option.Options) (*members, error) {
 	}
 	m.ClusterMembers.update(initMS)
 
+	// Add all members to list of known members
 	if len(opt.ClusterJoinURLs) != 0 {
 		for _, peerURL := range opt.ClusterJoinURLs {
 			initMS = append(initMS, &member{
@@ -91,13 +101,6 @@ func newMembers(opt *option.Options) (*members, error) {
 		}
 	}
 	m.KnownMembers.update(initMS)
-
-	err := m.load()
-	if err != nil {
-		return nil, err
-	}
-
-	return m, nil
 }
 
 func (m *members) fileExist() bool {
@@ -110,7 +113,7 @@ func (m *members) load() error {
 		return nil
 	}
 
-	buff, err := ioutil.ReadFile(m.file)
+	buff, err := os.ReadFile(m.file)
 	if err != nil {
 		return err
 	}
@@ -146,7 +149,7 @@ func (m *members) store() {
 		}
 	}
 
-	err = ioutil.WriteFile(m.file, buff, 0o644)
+	err = os.WriteFile(m.file, buff, 0o644)
 	if err != nil {
 		logger.Errorf("write file %s failed: %v", m.file, err)
 	} else {
@@ -175,7 +178,7 @@ func (m *members) _self() *member {
 		return s
 	}
 
-	if m.opt.ClusterRole == "writer" {
+	if m.opt.ClusterRole == "primary" {
 		logger.Errorf("BUG: can't get self from cluster members: %s "+
 			"knownMembers: %s", m.ClusterMembers, m.KnownMembers)
 	}
@@ -195,19 +198,6 @@ func (m *members) _selfWithoutID() *member {
 	s := m._self()
 	s.ID = 0
 	return s
-}
-
-func (m *members) isSelfIDChanged() bool {
-	return m.selfIDChanged
-}
-
-func (m *members) clusterMember() *membersSlice {
-	m.RLock()
-	defer m.RUnlock()
-
-	copied := m.ClusterMembers.copy()
-
-	return &copied
 }
 
 func (m *members) clusterMembersLen() int {
@@ -237,6 +227,9 @@ func (m *members) updateClusterMembers(pbMembers []*pb.Member) {
 	// NOTE: KnownMembers store members as many as possible
 	m.KnownMembers.update(*m.ClusterMembers)
 
+	// When cluster is initialized member by member, persist KnownMembers and ClusterMembers
+	// to disk for failure recovery. If a member fails for any reason before it has been added
+	// to cluster, the persisted file can be used to continue initialization.
 	m.store()
 }
 
@@ -244,18 +237,6 @@ func (m *members) knownMembersLen() int {
 	m.RLock()
 	defer m.RUnlock()
 	return m.KnownMembers.Len()
-}
-
-// NOTE: Maybe use it in future in case of connecting
-// one member purged but running at another etcd cluster.
-func (m *members) deleteKnownMember(name string) {
-	m.Lock()
-	defer m.Unlock()
-
-	// NOTE: It's fine to delete myself,
-	// because it will restore myself in newMembers while restarting.
-	m.KnownMembers.deleteByName(name)
-	m.store()
 }
 
 func (m *members) knownPeerURLs() []string {

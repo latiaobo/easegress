@@ -27,6 +27,11 @@ type (
 	// HTTPHandler is the common handler for the all backends
 	// which handle the traffic from HTTPServer.
 	HTTPHandler interface {
-		Handle(ctx context.HTTPContext)
+		Handle(ctx context.HTTPContext) string
+	}
+
+	// MuxMapper gets HTTP handler pipeline with mutex
+	MuxMapper interface {
+		GetHandler(name string) (HTTPHandler, bool)
 	}
 )

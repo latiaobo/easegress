@@ -27,7 +27,7 @@ import (
 
 	"github.com/megaease/easegress/pkg/common"
 	"github.com/megaease/easegress/pkg/option"
-	"github.com/megaease/easegress/pkg/util/timetool"
+	"github.com/megaease/easegress/pkg/util/fasttime"
 )
 
 // Init initializes logger.
@@ -35,6 +35,30 @@ func Init(opt *option.Options) {
 	initDefault(opt)
 	initHTTPFilter(opt)
 	initRestAPI(opt)
+}
+
+// InitNop initializes all logger as nop, mainly for unit testing
+func InitNop() {
+	nop := zap.NewNop()
+	httpFilterAccessLogger = nop.Sugar()
+	httpFilterDumpLogger = nop.Sugar()
+	restAPILogger = nop.Sugar()
+
+	defaultLogger = nop.Sugar()
+	gressLogger = defaultLogger
+	stderrLogger = defaultLogger
+}
+
+// InitMock initializes all logger to print stdout, mainly for unit testing
+func InitMock() {
+	mock := zap.NewExample()
+	httpFilterAccessLogger = mock.Sugar()
+	httpFilterDumpLogger = mock.Sugar()
+	restAPILogger = mock.Sugar()
+
+	defaultLogger = mock.Sugar()
+	gressLogger = defaultLogger
+	stderrLogger = defaultLogger
 }
 
 const (
@@ -50,7 +74,7 @@ const (
 	systemLogMaxCacheCount = 0
 
 	// NOTE: Under some pressure, it's easy to produce more than 1024 log entries
-	// within cacheTimeout(2s), so it's reasonalble to flush them at this moment.
+	// within cacheTimeout(2s), so it's reasonable to flush them at this moment.
 	trafficLogMaxCacheCount = 1024
 )
 
@@ -58,9 +82,9 @@ var (
 	defaultLogger          *zap.SugaredLogger // equal stderrLogger + gressLogger
 	stderrLogger           *zap.SugaredLogger
 	gressLogger            *zap.SugaredLogger
-	httpFilterAccessLogger *zap.Logger
-	httpFilterDumpLogger   *zap.Logger
-	restAPILogger          *zap.Logger
+	httpFilterAccessLogger *zap.SugaredLogger
+	httpFilterDumpLogger   *zap.SugaredLogger
+	restAPILogger          *zap.SugaredLogger
 )
 
 // EtcdClientLoggerConfig generates the config of etcd client logger.
@@ -68,9 +92,13 @@ func EtcdClientLoggerConfig(opt *option.Options, filename string) *zap.Config {
 	encoderConfig := defaultEncoderConfig()
 
 	level := zap.NewAtomicLevel()
-	level.SetLevel(zapcore.DebugLevel)
+	if opt.Debug {
+		level.SetLevel(zapcore.DebugLevel)
+	} else {
+		level.SetLevel(zapcore.InfoLevel)
+	}
 
-	outputPaths := []string{filepath.Join(opt.AbsLogDir, filename)}
+	outputPaths := []string{common.NormalizeZapLogPath(filepath.Join(opt.AbsLogDir, filename))}
 
 	return &zap.Config{
 		Level:            level,
@@ -83,7 +111,7 @@ func EtcdClientLoggerConfig(opt *option.Options, filename string) *zap.Config {
 
 func defaultEncoderConfig() zapcore.EncoderConfig {
 	timeEncoder := func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-		enc.AppendString(t.Format(timetool.RFC3339Milli))
+		enc.AppendString(fasttime.Format(t, fasttime.RFC3339Milli))
 	}
 
 	return zapcore.EncoderConfig{
@@ -137,7 +165,11 @@ func initRestAPI(opt *option.Options) {
 	restAPILogger = newPlainLogger(opt, adminAPIFilename, systemLogMaxCacheCount)
 }
 
-func newPlainLogger(opt *option.Options, filename string, maxCacheCount uint32) *zap.Logger {
+func newPlainLogger(opt *option.Options, filename string, maxCacheCount uint32) *zap.SugaredLogger {
+	if opt.DisableAccessLog {
+		return zap.NewNop().Sugar()
+	}
+
 	encoderConfig := zapcore.EncoderConfig{
 		TimeKey:       "",
 		LevelKey:      "",
@@ -156,5 +188,5 @@ func newPlainLogger(opt *option.Options, filename string, maxCacheCount uint32) 
 	syncer := zapcore.AddSync(fr)
 	core := zapcore.NewCore(zapcore.NewConsoleEncoder(encoderConfig), syncer, zap.DebugLevel)
 
-	return zap.New(core)
+	return zap.New(core).Sugar()
 }

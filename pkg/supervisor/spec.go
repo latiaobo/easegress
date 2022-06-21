@@ -19,17 +19,20 @@ package supervisor
 
 import (
 	"fmt"
+	"reflect"
 
-	yaml "gopkg.in/yaml.v2"
-
+	"github.com/megaease/easegress/pkg/util/yamltool"
 	"github.com/megaease/easegress/pkg/v"
 )
 
 type (
 	// Spec is the universal spec for all objects.
 	Spec struct {
+		super *Supervisor
+
 		yamlConfig string
 		meta       *MetaSpec
+		rawSpec    map[string]interface{}
 		objectSpec interface{}
 	}
 
@@ -40,46 +43,84 @@ type (
 	}
 )
 
-func newSpecInternal(meta *MetaSpec, objectSpec interface{}) *Spec {
-	return &Spec{
-		meta:       meta,
-		objectSpec: objectSpec,
+func (s *Supervisor) newSpecInternal(meta *MetaSpec, objectSpec interface{}) *Spec {
+	objectBuff := yamltool.Marshal(objectSpec)
+	metaBuff := yamltool.Marshal(meta)
+
+	var rawSpec map[string]interface{}
+	yamltool.Unmarshal(objectBuff, &rawSpec)
+	yamltool.Unmarshal(metaBuff, &rawSpec)
+
+	buff := yamltool.Marshal(rawSpec)
+	spec, err := s.NewSpec(string(buff))
+	if err != nil {
+		panic(fmt.Errorf("new spec for %s failed: %v", buff, err))
 	}
+
+	return spec
+}
+
+// NewSpec is the wrapper of NewSpec of global supervisor.
+func NewSpec(yamlConfig string) (*Spec, error) {
+	return globalSuper.NewSpec(yamlConfig)
 }
 
 // NewSpec creates a spec and validates it.
-func NewSpec(yamlConfig string) (*Spec, error) {
-	s := &Spec{
-		yamlConfig: yamlConfig,
-	}
+func (s *Supervisor) NewSpec(yamlConfig string) (spec *Spec, err error) {
+	spec = &Spec{super: s}
 
+	defer func() {
+		if r := recover(); r != nil {
+			spec = nil
+			err = fmt.Errorf("%v", r)
+		} else {
+			err = nil
+		}
+	}()
+
+	yamlBuff := []byte(yamlConfig)
+
+	// Meta part.
 	meta := &MetaSpec{}
-	err := yaml.Unmarshal([]byte(yamlConfig), meta)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal failed: %v", err)
-	}
-	vr := v.Validate(meta, []byte(yamlConfig))
-	if !vr.Valid() {
-		return nil, fmt.Errorf("validate metadata failed: \n%s", vr)
+	yamltool.Unmarshal(yamlBuff, meta)
+	verr := v.Validate(meta)
+	if !verr.Valid() {
+		panic(verr)
 	}
 
+	// Object self part.
 	rootObject, exists := objectRegistry[meta.Kind]
 	if !exists {
-		return nil, fmt.Errorf("kind %s not found", meta.Kind)
+		panic(fmt.Errorf("kind %s not found", meta.Kind))
+	}
+	objectSpec := rootObject.DefaultSpec()
+	yamltool.Unmarshal(yamlBuff, objectSpec)
+	verr = v.Validate(objectSpec)
+	if !verr.Valid() {
+		panic(verr)
 	}
 
-	s.meta, s.objectSpec = meta, rootObject.DefaultSpec()
+	// Build final yaml config and raw spec.
+	var rawSpec map[string]interface{}
+	objectBuff := yamltool.Marshal(objectSpec)
+	yamltool.Unmarshal(objectBuff, &rawSpec)
 
-	err = yaml.Unmarshal([]byte(yamlConfig), s.objectSpec)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal failed: %v", err)
-	}
-	vr = v.Validate(s.objectSpec, []byte(yamlConfig))
-	if !vr.Valid() {
-		return nil, fmt.Errorf("validate spec failed: \n%s", vr)
-	}
+	metaBuff := yamltool.Marshal(meta)
+	yamltool.Unmarshal(metaBuff, &rawSpec)
 
-	return s, nil
+	yamlConfig = string(yamltool.Marshal(rawSpec))
+
+	spec.meta = meta
+	spec.objectSpec = objectSpec
+	spec.rawSpec = rawSpec
+	spec.yamlConfig = yamlConfig
+
+	return
+}
+
+// Super returns supervisor
+func (s *Spec) Super() *Supervisor {
+	return s.super
 }
 
 // Name returns name.
@@ -93,7 +134,17 @@ func (s *Spec) YAMLConfig() string {
 	return s.yamlConfig
 }
 
-// ObjectSpec returns the object spec.
+// RawSpec returns the final complete spec in type map[string]interface{}.
+func (s *Spec) RawSpec() map[string]interface{} {
+	return s.rawSpec
+}
+
+// Equals compares two Specs.
+func (s *Spec) Equals(other *Spec) bool {
+	return reflect.DeepEqual(s.RawSpec(), other.RawSpec())
+}
+
+// ObjectSpec returns the object spec in its own type.
 func (s *Spec) ObjectSpec() interface{} {
 	return s.objectSpec
 }

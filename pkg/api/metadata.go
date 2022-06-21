@@ -56,7 +56,7 @@ var (
 	filterKinds    []string
 )
 
-func (s *Server) setupMetadaAPIs() {
+func (s *Server) initMetadata() {
 	filterRegistry := httppipeline.GetFilterRegistry()
 	for kind, f := range filterRegistry {
 		filterMetaBook[kind] = &FilterMeta{
@@ -70,31 +70,31 @@ func (s *Server) setupMetadaAPIs() {
 	}
 	sort.Strings(filterKinds)
 
-	metadataAPIs := make([]*APIEntry, 0)
-	metadataAPIs = append(metadataAPIs,
-		&APIEntry{
+}
+
+func (s *Server) metadataAPIEntries() []*Entry {
+	return []*Entry{
+		{
 			Path:    FilterMetaPrefix,
 			Method:  "GET",
 			Handler: s.listFilters,
 		},
-		&APIEntry{
+		{
 			Path:    FilterMetaPrefix + "/{kind}" + "/description",
 			Method:  "GET",
 			Handler: s.getFilterDescription,
 		},
-		&APIEntry{
+		{
 			Path:    FilterMetaPrefix + "/{kind}" + "/schema",
 			Method:  "GET",
 			Handler: s.getFilterSchema,
 		},
-		&APIEntry{
+		{
 			Path:    FilterMetaPrefix + "/{kind}" + "/results",
 			Method:  "GET",
 			Handler: s.getFilterResults,
 		},
-	)
-
-	s.RegisterAPIs(metadataAPIs)
+	}
 }
 
 func (s *Server) listFilters(w http.ResponseWriter, r *http.Request) {

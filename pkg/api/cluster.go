@@ -24,6 +24,9 @@ import (
 
 	yaml "gopkg.in/yaml.v2"
 
+	"github.com/megaease/easegress/pkg/object/httppipeline"
+	"github.com/megaease/easegress/pkg/object/httpserver"
+	"github.com/megaease/easegress/pkg/object/trafficcontroller"
 	"github.com/megaease/easegress/pkg/supervisor"
 )
 
@@ -75,7 +78,7 @@ func (s *Server) _getObject(name string) *supervisor.Spec {
 		return nil
 	}
 
-	spec, err := supervisor.NewSpec(*value)
+	spec, err := s.super.NewSpec(*value)
 	if err != nil {
 		panic(fmt.Errorf("bad spec(err: %v) from yaml: %s", err, *value))
 	}
@@ -91,7 +94,7 @@ func (s *Server) _listObjects() []*supervisor.Spec {
 
 	specs := make([]*supervisor.Spec, 0, len(kvs))
 	for _, v := range kvs {
-		spec, err := supervisor.NewSpec(v)
+		spec, err := s.super.NewSpec(v)
 		if err != nil {
 			panic(fmt.Errorf("bad spec(err: %v) from yaml: %s", err, v))
 		}
@@ -163,4 +166,41 @@ func (s *Server) _listStatusObjects() map[string]map[string]interface{} {
 	}
 
 	return status
+}
+
+func (s *Server) _getStatusObjectFromTrafficController(name string, spec *supervisor.Spec) map[string]string {
+	key := s.cluster.Layout().StatusObjectName(trafficcontroller.Kind, name)
+	prefix := s.cluster.Layout().StatusObjectPrefix(key)
+	kvs, err := s.cluster.GetPrefix(prefix)
+	if err != nil {
+		ClusterPanic(err)
+	}
+
+	ans := make(map[string]string)
+	for _, v := range kvs {
+		if spec.Kind() == httpserver.Kind {
+			status := &trafficcontroller.HTTPServerStatus{}
+			err = yaml.Unmarshal([]byte(v), status)
+			if err != nil {
+				ClusterPanic(fmt.Errorf("unmarshal %s to yaml failed: %v", v, err))
+			}
+			b, err := yaml.Marshal(status.Status)
+			if err != nil {
+				ClusterPanic(fmt.Errorf("unmarshal %v to yaml failed: %v", status.Status, err))
+			}
+			ans[key] = string(b)
+		} else if spec.Kind() == httppipeline.Kind {
+			status := &trafficcontroller.HTTPPipelineStatus{}
+			err = yaml.Unmarshal([]byte(v), status)
+			if err != nil {
+				ClusterPanic(fmt.Errorf("unmarshal %s to yaml failed: %v", v, err))
+			}
+			b, err := yaml.Marshal(status.Status)
+			if err != nil {
+				ClusterPanic(fmt.Errorf("unmarshal %v to yaml failed: %v", status.Status, err))
+			}
+			ans[key] = string(b)
+		}
+	}
+	return ans
 }

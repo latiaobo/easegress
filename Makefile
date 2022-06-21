@@ -4,15 +4,19 @@ SHELL:=/bin/sh
 		mod_update vendor_from_mod vendor_clean
 
 export GO111MODULE=on
-export GOPROXY=https://goproxy.io
 
 # Path Related
 MKFILE_PATH := $(abspath $(lastword $(MAKEFILE_LIST)))
 MKFILE_DIR := $(dir $(MKFILE_PATH))
 RELEASE_DIR := ${MKFILE_DIR}bin
+GO_PATH := $(shell go env | grep GOPATH | awk -F '"' '{print $$2}')
+HTTPSERVER_TEST_PATH := build/test
+
+# Image Name
+IMAGE_NAME?=megaease/easegress
 
 # Version
-RELEASE?=1.0.0
+RELEASE?=v1.5.2
 
 # Git Related
 GIT_REPO_INFO=$(shell cd ${MKFILE_DIR} && git config --get remote.origin.url)
@@ -23,12 +27,35 @@ endif
 # Build Flags
 GO_LD_FLAGS= "-s -w -X github.com/megaease/easegress/pkg/version.RELEASE=${RELEASE} -X github.com/megaease/easegress/pkg/version.COMMIT=${GIT_COMMIT} -X github.com/megaease/easegress/pkg/version.REPO=${GIT_REPO_INFO}"
 
+# Cgo is disabled by default
+ENABLE_CGO= CGO_ENABLED=0
+
+# Check Go build tags, the tags are from command line of make
+ifdef GOTAGS
+  GO_BUILD_TAGS= -tags ${GOTAGS}
+  # Must enable Cgo when wasmhost is included
+  ifeq ($(findstring wasmhost,${GOTAGS}), wasmhost)
+	ENABLE_CGO= CGO_ENABLED=1
+  endif
+endif
+
+# When build binaries for docker, we put the binaries to another folder to avoid
+# overwriting existing build result, or Mac/Windows user will have to do a rebuild
+# after build the docker image, which is Linux only currently.
+ifdef DOCKER
+  RELEASE_DIR= ${MKFILE_DIR}build/bin
+endif
+
 # Targets
 TARGET_SERVER=${RELEASE_DIR}/easegress-server
 TARGET_CLIENT=${RELEASE_DIR}/egctl
 
 # Rules
 build: build_client build_server
+
+wasm: ENABLE_CGO=CGO_ENABLED=1
+wasm: GO_BUILD_TAGS=-tags wasmhost
+wasm: build
 
 build_client:
 	@echo "build client"
@@ -39,17 +66,54 @@ build_client:
 build_server:
 	@echo "build server"
 	cd ${MKFILE_DIR} && \
-	CGO_ENABLED=0 go build -v -trimpath -ldflags ${GO_LD_FLAGS} \
+	${ENABLE_CGO} go build ${GO_BUILD_TAGS} -v -trimpath -ldflags ${GO_LD_FLAGS} \
+	-o ${TARGET_SERVER} ${MKFILE_DIR}cmd/server
+
+dev_build: dev_build_client dev_build_server
+
+dev_build_client:
+	@echo "build dev client"
+	cd ${MKFILE_DIR} && \
+	go build -v -race -ldflags ${GO_LD_FLAGS} \
+	-o ${TARGET_CLIENT} ${MKFILE_DIR}cmd/client
+
+dev_build_server:
+	@echo "build dev server"
+	cd ${MKFILE_DIR} && \
+	go build -v -race -ldflags ${GO_LD_FLAGS} \
 	-o ${TARGET_SERVER} ${MKFILE_DIR}cmd/server
 
 build_docker:
-	docker build -t megaease/easegress:${RELEASE} -f ./build/package/Dockerfile .
+	cd ${MKFILE_DIR}
+	mkdir -p build/cache
+	mkdir -p build/bin
+	docker run -w /egsrc -u ${shell id -u}:${shell id -g} --rm \
+	-v ${GO_PATH}:/gopath -v ${MKFILE_DIR}:/egsrc -v ${MKFILE_DIR}build/cache:/gocache \
+	-e GOPROXY=https://goproxy.io,direct -e GOCACHE=/gocache -e GOPATH=/gopath \
+	megaease/golang:1.18-alpine make build DOCKER=true
+	docker build -t ${IMAGE_NAME}:${RELEASE} -f ./build/package/Dockerfile .
+	docker tag ${IMAGE_NAME}:${RELEASE} ${IMAGE_NAME}:latest
+	docker tag ${IMAGE_NAME}:latest ${IMAGE_NAME}:server-sidecar
+	docker tag ${IMAGE_NAME}:latest ${IMAGE_NAME}:easemesh
 
 test:
-	@go list ./... | grep -v -E 'vendor' | xargs -n1 go test
+	cd ${MKFILE_DIR}
+	go mod tidy
+	git diff --exit-code go.mod go.sum
+	go mod verify
+	go test -v ./... ${TEST_FLAGS}
+
+httpserver_test: build
+	{ \
+	set -e ;\
+	cd ${HTTPSERVER_TEST_PATH} ;\
+	./httpserver_test.sh ;\
+    }
 
 clean:
 	rm -rf ${RELEASE_DIR}
+	rm -rf ${MKFILE_DIR}build/cache
+	rm -rf ${MKFILE_DIR}build/bin
 
 run: build_server
 

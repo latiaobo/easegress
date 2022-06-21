@@ -20,9 +20,8 @@ package command
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
-	"os"
 
 	yamljsontool "github.com/ghodss/yaml"
 	"github.com/spf13/cobra"
@@ -61,6 +60,18 @@ const (
 	statusObjectURL  = apiURL + "/status/objects/%s"
 	statusObjectsURL = apiURL + "/status/objects"
 
+	wasmCodeURL = apiURL + "/wasm/code"
+	wasmDataURL = apiURL + "/wasm/data/%s/%s"
+
+	customDataKindURL     = apiURL + "/customdatakinds"
+	customDataKindItemURL = apiURL + "/customdatakinds/%s"
+	customDataURL         = apiURL + "/customdata/%s"
+	customDataItemURL     = apiURL + "/customdata/%s/%s"
+
+	profileURL      = apiURL + "/profile"
+	profileStartURL = apiURL + "/profile/start/%s"
+	profileStopURL  = apiURL + "/profile/stop"
+
 	// MeshTenantsURL is the mesh tenant prefix.
 	MeshTenantsURL = apiURL + "/mesh/tenants"
 
@@ -97,7 +108,7 @@ const (
 	// MeshServiceInstanceURL is the mesh service path.
 	MeshServiceInstanceURL = apiURL + "/mesh/serviceinstances/%s/%s"
 
-	// MeshIngressURL is the mesh ingress prefix.
+	// MeshIngressesURL is the mesh ingress prefix.
 	MeshIngressesURL = apiURL + "/mesh/ingresses"
 
 	// MeshIngressURL is the mesh ingress path.
@@ -124,7 +135,7 @@ func handleRequest(httpMethod string, url string, reqBody []byte, cmd *cobra.Com
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		ExitWithErrorf("%s failed: %v", cmd.Short, err)
 	}
@@ -158,31 +169,4 @@ func printBody(body []byte) {
 	}
 
 	fmt.Printf("%s", output)
-}
-
-func readFromFileOrStdin(specFile string, cmd *cobra.Command) ([]byte, string) {
-	var buff []byte
-	var err error
-	if specFile != "" {
-		buff, err = ioutil.ReadFile(specFile)
-		if err != nil {
-			ExitWithErrorf("%s failed: %v", cmd.Short, err)
-		}
-	} else {
-		buff, err = ioutil.ReadAll(os.Stdin)
-		if err != nil {
-			ExitWithErrorf("%s failed: %v", cmd.Short, err)
-		}
-	}
-
-	var spec struct {
-		Kind string `yaml:"kind"`
-		Name string `yaml:"name"`
-	}
-	err = yaml.Unmarshal(buff, &spec)
-	if err != nil {
-		ExitWithErrorf("%s failed, invalid spec: %v", cmd.Short, err)
-	}
-
-	return buff, spec.Name
 }
